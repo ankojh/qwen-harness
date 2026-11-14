@@ -43,7 +43,7 @@ const FINISH_CLASS = {
   error: 'error',
 }
 
-function deriveChannels(tokens) {
+export function deriveChannels(tokens) {
   const channels = { thinking: '', answer: '', raw: '' }
   for (const token of tokens) {
     channels.raw += token.text || ''
