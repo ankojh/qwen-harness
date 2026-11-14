@@ -8,7 +8,7 @@ template drops once a later user message exists.
 """
 
 from config import AppConfig
-from prompt import Session, build_prompt
+from prompt import Session, build_prompt, checkpoint_boundary, relabel_token_ids
 
 MODEL_INFO = {
     "max_position_embeddings": 10_000,
@@ -396,3 +396,176 @@ def test_token_text_and_special_fall_back_without_decode_support():
         assert piece["text"] == piece["piece"]  # decode failed -> fell back
         assert piece["special"] is False
     assert report["spans"] is None
+
+
+# --------------------------------------------------------------------------
+# relabel_token_ids() -- the one-token rule for a cache relabel
+# --------------------------------------------------------------------------
+class WordTokenizer:
+    """A fake tokenizer that treats each whitespace-separated run as one token.
+
+    Real tokenizers often map a common word (with its leading space) to a
+    single id; this fake is enough to exercise the one-token rule without a
+    real vocabulary.
+    """
+
+    VOCAB = [" Alice", " Bob", "My", " name", " is", "."]
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        i = 0
+        while i < len(text):
+            match = next((w for w in self.VOCAB if text.startswith(w, i)), None)
+            if match:
+                ids.append(self.VOCAB.index(match) + 1)
+                i += len(match)
+            else:
+                ids.append(1000 + ord(text[i]))
+                i += 1
+        return ids
+
+
+def test_relabel_token_ids_accepts_a_single_token_string():
+    assert relabel_token_ids(WordTokenizer(), " Alice") == [1]
+
+
+def test_relabel_token_ids_reports_every_token_for_a_multi_token_string():
+    ids = relabel_token_ids(WordTokenizer(), "My name")
+    assert len(ids) == 2
+    assert ids != [ids[0]]
+
+
+# --------------------------------------------------------------------------
+# checkpoint_boundary() -- the manual-checkpoint endpoint's boundary choice
+# --------------------------------------------------------------------------
+def _span_prompt(messages, add_generation_prompt=True):
+    template_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+    tokenizer = SpanTokenizer()
+    text = tokenizer.render(template_messages, add_generation_prompt=add_generation_prompt)
+    token_ids = tokenizer.encode(text)
+    return template_messages, token_ids, tokenizer
+
+
+def test_checkpoint_boundary_returns_the_position_after_the_message():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    template_messages, token_ids, tokenizer = _span_prompt(messages)
+    config = AppConfig(max_tokens=10, context_budget=1000)
+
+    expected_text = tokenizer.render(template_messages[:1], add_generation_prompt=False)
+    expected_position = len(tokenizer.encode(expected_text))
+
+    boundary = checkpoint_boundary(
+        template_messages=template_messages,
+        token_ids=token_ids,
+        config=config,
+        tokenizer=tokenizer,
+        thinking_supported=True,
+        template_kwargs={},
+        after_message=1,
+    )
+    assert boundary["ok"] is True
+    assert boundary["position"] == expected_position
+    assert expected_position < len(token_ids)
+
+
+def test_checkpoint_boundary_rejects_a_boundary_covering_the_whole_prompt():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    # No generation prompt in the full text, so a boundary rendered the same
+    # way (add_generation_prompt=False) after the last message equals the
+    # whole prompt exactly, leaving no token to feed.
+    template_messages, token_ids, tokenizer = _span_prompt(
+        messages, add_generation_prompt=False
+    )
+    config = AppConfig(max_tokens=10, context_budget=1000)
+    boundary = checkpoint_boundary(
+        template_messages=template_messages,
+        token_ids=token_ids,
+        config=config,
+        tokenizer=tokenizer,
+        thinking_supported=True,
+        template_kwargs={},
+        after_message=len(template_messages),
+    )
+    assert boundary["ok"] is False
+    assert "covers the whole prompt" in boundary["reason"]
+
+
+def test_checkpoint_boundary_rejects_a_token_mismatch():
+    messages = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "secret"},
+        {"role": "user", "content": "u2"},
+    ]
+    template_messages = [
+        {"role": m["role"], "content": m["content"], **(
+            {"reasoning_content": m["reasoning_content"]} if "reasoning_content" in m else {}
+        )}
+        for m in messages
+    ]
+    tokenizer = FakeTokenizer()
+    text = tokenizer.render(template_messages, add_generation_prompt=True)
+    token_ids = tokenizer.encode(text)
+    config = AppConfig(max_tokens=10, context_budget=1000)
+
+    # Prefix [user, assistant-with-reasoning] renders the reasoning because no
+    # later user exists in that slice, but the full prompt drops it -- not a
+    # token prefix of the full prompt.
+    boundary = checkpoint_boundary(
+        template_messages=template_messages,
+        token_ids=token_ids,
+        config=config,
+        tokenizer=tokenizer,
+        thinking_supported=True,
+        template_kwargs={},
+        after_message=2,
+    )
+    assert boundary["ok"] is False
+    assert "not a token prefix" in boundary["reason"]
+
+
+def test_build_prompt_checkpoint_table_matches_checkpoint_boundary():
+    """Regression: build_prompt's own checkpoint table must report the same
+    positions checkpoint_boundary would compute for each boundary."""
+    config = AppConfig(cache_checkpoints="every_message", max_tokens=10, context_budget=1000)
+    report = build_prompt(
+        conversation(),
+        config,
+        FakeTokenizer(),
+        model_info=MODEL_INFO,
+        capabilities={},
+    )
+    assert report["ok"] is True, report["error"]
+
+    template_messages = [
+        {
+            "role": m.role,
+            "content": m.content,
+            **({"reasoning_content": m.reasoning_content} if m.reasoning_content else {}),
+        }
+        for m in conversation().messages
+    ]
+
+    for entry in report["checkpoints"]:
+        direct = checkpoint_boundary(
+            template_messages=template_messages,
+            token_ids=report["token_ids"],
+            config=config,
+            tokenizer=FakeTokenizer(),
+            thinking_supported=True,
+            template_kwargs={},
+            after_message=entry["after_message"],
+        )
+        # build_prompt additionally rejects a boundary that does not advance
+        # past the previous accepted one; checkpoint_boundary alone does not
+        # know about that rule, so compare only when both agree it is a real
+        # token prefix.
+        if direct["ok"] and entry["ok"]:
+            assert direct["position"] == entry["position"]
+        elif not direct["ok"]:
+            assert entry["ok"] is False
