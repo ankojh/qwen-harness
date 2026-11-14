@@ -125,7 +125,11 @@ def _token_spans(
     and a trailing assistant segment without ``<|im_end|>`` is the opener.
     Positions are half-open.
     """
-    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_start = None
+    try:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    except Exception:  # noqa: BLE001 - reported as "no spans" rather than failing
+        return None
     if not isinstance(im_start, int) or im_start < 0:
         return None
     starts = [i for i, token_id in enumerate(token_ids) if token_id == im_start]
