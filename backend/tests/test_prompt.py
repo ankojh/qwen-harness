@@ -27,6 +27,11 @@ class FakeTokenizer:
     def convert_ids_to_tokens(self, token_id):
         return chr(token_id - 100)
 
+    def convert_tokens_to_ids(self, token):
+        # This fake has no "<|im_start|>" token at all, like a tokenizer with
+        # a different template: unknown-token id, same as real tokenizers.
+        return -1
+
     def render(self, messages, add_generation_prompt):
         if not any(message["role"] == "user" for message in messages):
             raise ValueError("No user query found in messages")
@@ -181,3 +186,213 @@ def test_off_and_raw_have_no_checkpoints_with_a_reason():
     )
     assert raw["checkpoints"] == []
     assert "raw mode" in raw["checkpoint_reason"]
+
+
+# --------------------------------------------------------------------------
+# Per-token pieces and spans (``include_pieces=True``)
+# --------------------------------------------------------------------------
+class SpanTokenizer:
+    """A fake tokenizer with real ``<|im_start|>``-style special tokens.
+
+    Unlike ``FakeTokenizer`` (one token per character), this one tokenizes
+    known markers -- ``<|im_start|>``, ``<|im_end|>``, role names, ``<think>``
+    tags and newlines -- as whole tokens, which is what ``_token_spans``
+    needs to find message boundaries. Everything else still falls back to
+    one token per character, so it stays simple and symmetric.
+    """
+
+    chat_template = "qwen-like"
+    KNOWN = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "\n",
+        "system",
+        "user",
+        "assistant",
+    ]
+    SPECIAL_COUNT = 4  # the markers, not the role names or the newline
+
+    def _char_id(self, char: str) -> int:
+        return ord(char) + 1000
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        i = 0
+        while i < len(text):
+            match = next((k for k in self.KNOWN if text.startswith(k, i)), None)
+            if match:
+                ids.append(self.KNOWN.index(match) + 1)
+                i += len(match)
+            else:
+                ids.append(self._char_id(text[i]))
+                i += 1
+        return ids
+
+    def convert_ids_to_tokens(self, token_id):
+        if 1 <= token_id <= len(self.KNOWN):
+            return self.KNOWN[token_id - 1]
+        return chr(token_id - 1000)
+
+    def convert_tokens_to_ids(self, token):
+        if token in self.KNOWN:
+            return self.KNOWN.index(token) + 1
+        return -1
+
+    def decode(self, ids):
+        return "".join(self.convert_ids_to_tokens(i) for i in ids)
+
+    def is_special_token(self, token_id):
+        return 1 <= token_id <= self.SPECIAL_COUNT
+
+    def render(self, messages, add_generation_prompt):
+        parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages]
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n<think>\n")
+        return "".join(parts)
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=True,
+        chat_template=None,
+        **kwargs,
+    ):
+        text = self.render(messages, add_generation_prompt)
+        return self.encode(text) if tokenize else text
+
+
+SPAN_MODEL_INFO = {
+    "max_position_embeddings": 10_000,
+    "chat_template": "qwen-like",
+    "think_start": "<think>",
+    "think_end": "</think>",
+}
+
+
+def test_pieces_carry_decoded_text_and_special_flag():
+    session = Session(
+        mode="messages", messages=[{"role": "user", "content": "hi"}]
+    )
+    report = build_prompt(
+        session,
+        AppConfig(max_tokens=10, context_budget=1000),
+        SpanTokenizer(),
+        model_info=SPAN_MODEL_INFO,
+        capabilities={},
+        include_pieces=True,
+    )
+    assert report["ok"] is True, report["error"]
+    pieces = report["token_pieces"]
+    assert pieces is not None
+    tokenizer = SpanTokenizer()
+    for piece, token_id in zip(pieces, report["token_ids"]):
+        assert piece["id"] == token_id
+        assert piece["piece"] == tokenizer.convert_ids_to_tokens(token_id)
+        assert piece["text"] == tokenizer.decode([token_id])
+
+    by_piece = {p["piece"]: p["special"] for p in pieces}
+    assert by_piece["<|im_start|>"] is True
+    assert by_piece["<|im_end|>"] is True
+    assert by_piece["user"] is False
+    assert by_piece["\n"] is False
+    assert by_piece["h"] is False  # a plain content character
+
+
+def test_spans_match_submitted_messages_and_trailing_opener():
+    session = Session(
+        mode="messages",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "again"},
+        ],
+    )
+    config = AppConfig(
+        system_prompt="be terse", max_tokens=10, context_budget=1000
+    )
+    report = build_prompt(
+        session,
+        config,
+        SpanTokenizer(),
+        model_info=SPAN_MODEL_INFO,
+        capabilities={},
+        include_pieces=True,
+    )
+    assert report["ok"] is True, report["error"]
+    submitted = report["submitted_messages"]
+    spans = report["spans"]
+    assert spans is not None
+    # 4 submitted messages (system + 3) plus the trailing assistant opener.
+    assert len(spans) == len(submitted) + 1
+
+    for span, message in zip(spans, submitted):
+        assert span["kind"] == "message"
+        assert span["index"] == message["index"]
+        assert span["role"] == message["role"]
+        assert span["source"] == message["source"]
+        assert span["end"] > span["start"]
+
+    opener = spans[-1]
+    assert opener["kind"] == "opener"
+    assert opener["index"] is None
+    assert opener["role"] == "assistant"
+    assert opener["source"] == "template"
+    assert opener["end"] == len(report["token_ids"])
+
+    # Spans tile the whole prompt with no gaps or overlaps.
+    assert spans[0]["start"] == 0
+    for left, right in zip(spans, spans[1:]):
+        assert left["end"] == right["start"]
+
+
+def test_spans_are_none_in_raw_mode():
+    report = build_prompt(
+        Session(mode="raw", raw_text="hello", messages=[]),
+        AppConfig(max_tokens=10, context_budget=1000),
+        SpanTokenizer(),
+        model_info=SPAN_MODEL_INFO,
+        capabilities={},
+        include_pieces=True,
+    )
+    assert report["token_pieces"] is not None
+    assert report["spans"] is None
+
+
+def test_pieces_and_spans_are_none_without_include_pieces():
+    session = Session(
+        mode="messages", messages=[{"role": "user", "content": "hi"}]
+    )
+    report = build_prompt(
+        session,
+        AppConfig(max_tokens=10, context_budget=1000),
+        SpanTokenizer(),
+        model_info=SPAN_MODEL_INFO,
+        capabilities={},
+    )
+    assert report["token_pieces"] is None
+    assert report["spans"] is None
+
+
+def test_token_text_and_special_fall_back_without_decode_support():
+    """FakeTokenizer has no decode()/is_special_token(); _token_text and
+    _token_is_special must fall back instead of raising, and spans must come
+    back None rather than crash on a tokenizer with no "<|im_start|>" id."""
+    report = build_prompt(
+        conversation(),
+        AppConfig(max_tokens=10, context_budget=1000),
+        FakeTokenizer(),
+        model_info=MODEL_INFO,
+        capabilities={},
+        include_pieces=True,
+    )
+    assert report["ok"] is True, report["error"]
+    pieces = report["token_pieces"]
+    assert pieces is not None
+    for piece in pieces:
+        assert piece["text"] == piece["piece"]  # decode failed -> fell back
+        assert piece["special"] is False
+    assert report["spans"] is None

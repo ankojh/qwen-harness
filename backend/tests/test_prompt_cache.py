@@ -8,7 +8,12 @@ so every reuse decision can be tested exactly and quickly.
 
 import copy
 
-from prompt_cache import PromptCacheStore, cache_nbytes, cache_types
+from prompt_cache import (
+    PromptCacheStore,
+    cache_nbytes,
+    cache_types,
+    describe_cache_layers,
+)
 
 KEY = PromptCacheStore.compat_key(
     model_path="model-a",
@@ -340,3 +345,127 @@ def test_evictions_are_counted():
     insert(store, [1, 2], max_entries=1, max_bytes=10_000)
     insert(store, [3, 4], max_entries=1, max_bytes=10_000)
     assert store.summary()["evictions_total"] == 1
+
+
+# ------------------------------------------------------------- token_lists()
+def test_token_lists_reports_all_entries_without_mlx():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3], kind="checkpoint", after_message=1)
+    insert(store, [1, 2, 3, 4, 5], kind="after-generation", after_message=2)
+
+    lists = store.token_lists()
+    assert [item["id"] for item in lists] == [1, 2]
+    assert lists[0] == {
+        "id": 1,
+        "kind": "checkpoint",
+        "after_message": 1,
+        "token_ids": [1, 2, 3],
+    }
+    assert lists[1]["token_ids"] == [1, 2, 3, 4, 5]
+    assert lists[1]["after_message"] == 2
+
+
+def test_token_lists_is_empty_for_an_empty_store():
+    assert PromptCacheStore().token_lists() == []
+
+
+# ----------------------------------------------------------------- get_entry
+def test_get_entry_returns_the_matching_entry_or_none():
+    store = PromptCacheStore()
+    info = insert(store, [1, 2, 3], after_message=1)
+
+    entry = store.get_entry(info["entry_id"])
+    assert entry is not None
+    assert entry.tokens == [1, 2, 3]
+    assert entry.after_message == 1
+
+    assert store.get_entry(info["entry_id"] + 999) is None
+
+
+# --------------------------------------------------- describe_cache_layers()
+class FakeArray:
+    """Shape/dtype/nbytes only -- enough for the metadata rows, no values."""
+
+    def __init__(self, shape, dtype, nbytes):
+        self.shape = shape
+        self.dtype = dtype
+        self.nbytes = nbytes
+
+
+class FakeArraysLayer:
+    """A linear-attention layer: a ``.cache`` list, no ``keys``/``values``."""
+
+    def __init__(self, nbytes=2_146_304):
+        self.cache = [FakeArray((1, 4, 1024), "float16", nbytes)]
+        self.nbytes = nbytes
+
+
+class FakeKVLayer:
+    """A full-attention layer: ``keys``/``values`` buffers sized by tokens."""
+
+    def __init__(self, offset, allocated_tokens, bytes_per_token=4096, dtype="float16"):
+        per_array = (bytes_per_token // 2) * allocated_tokens
+        self.offset = offset
+        self.keys = FakeArray((1, 4, allocated_tokens, 256), dtype, per_array)
+        self.values = FakeArray((1, 4, allocated_tokens, 256), dtype, per_array)
+        self.nbytes = self.keys.nbytes + self.values.nbytes
+
+
+def test_describe_cache_layers_arrays_layer_has_no_token_fields():
+    rows = describe_cache_layers(
+        [FakeArraysLayer()], layer_types=["linear_attention"]
+    )
+    row = rows[0]
+    assert row["index"] == 0
+    assert row["kind"] == "linear_attention"
+    assert row["used_tokens"] is None
+    assert row["allocated_tokens"] is None
+    assert row["used_bytes"] == row["allocated_bytes"] == 2_146_304
+    assert [a["name"] for a in row["arrays"]] == ["state[0]"]
+    assert row["arrays"][0]["nbytes"] == 2_146_304
+
+
+def test_describe_cache_layers_kv_layer_tracks_used_and_allocated_tokens():
+    # 8 KVCache layers at [1, 4, N, 256], 4096 bytes/token/layer (keys+values).
+    layer = FakeKVLayer(offset=100, allocated_tokens=256)
+    rows = describe_cache_layers([layer], layer_types=["full_attention"])
+    row = rows[0]
+    assert row["kind"] == "full_attention"
+    assert row["used_tokens"] == 100
+    assert row["allocated_tokens"] == 256
+    assert row["allocated_bytes"] == 4096 * 256
+    assert row["used_bytes"] == 4096 * 100
+    assert {a["name"] for a in row["arrays"]} == {"keys", "values"}
+
+
+def test_describe_cache_layers_handles_an_unused_fresh_entry():
+    layer = FakeKVLayer(offset=0, allocated_tokens=256)
+    row = describe_cache_layers([layer], layer_types=["full_attention"])[0]
+    assert row["used_tokens"] == 0
+    assert row["used_bytes"] == 0
+    assert row["allocated_bytes"] == 4096 * 256
+
+
+def test_describe_cache_layers_infers_kind_from_class_name_without_layer_types():
+    class QuantizedArraysCache(FakeArraysLayer):
+        pass
+
+    rows = describe_cache_layers([QuantizedArraysCache(), FakeKVLayer(0, 256)])
+    assert rows[0]["kind"] == "linear_attention"
+    assert rows[1]["kind"] == "full_attention"
+
+
+def test_describe_cache_layers_reports_every_layer_in_order():
+    cache = [FakeArraysLayer() for _ in range(3)] + [
+        FakeKVLayer(offset=10, allocated_tokens=256) for _ in range(2)
+    ]
+    layer_types = ["linear_attention"] * 3 + ["full_attention"] * 2
+    rows = describe_cache_layers(cache, layer_types=layer_types)
+    assert [row["index"] for row in rows] == [0, 1, 2, 3, 4]
+    assert [row["kind"] for row in rows] == [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "full_attention",
+    ]
