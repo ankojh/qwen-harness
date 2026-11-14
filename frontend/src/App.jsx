@@ -97,6 +97,44 @@ export default function App() {
   const activeGenRef = useRef(null)
   // Generation started by Send whose answer still has to join the session.
   const pendingTurnRef = useRef(null)
+  // One-line descriptions of the edits applied since the last turn.  The
+  // next recorded turn takes them and clears the list.
+  const [pendingEdits, setPendingEdits] = useState([])
+  const pendingEditsRef = useRef([])
+
+  const logEdit = useCallback((line) => {
+    pendingEditsRef.current = [...pendingEditsRef.current, line]
+    setPendingEdits(pendingEditsRef.current)
+  }, [])
+
+  // A cache action (delete, relabel, restore, save checkpoint) with its
+  // edit-log line: run it, log it, refresh state, surface errors.  ``line``
+  // may be a function of the result (for labels that need the entry id).
+  const runCacheAction = useCallback(
+    async (action, line, options = {}) => {
+      if (!options.silent) setActionError(null)
+      try {
+        const result = await action()
+        logEdit(typeof line === 'function' ? line(result) : line)
+        refreshState().catch(() => {})
+        return result
+      } catch (error) {
+        if (!options.silent) setActionError(formatError(error.detail || error))
+        throw error
+      }
+    },
+    [logEdit, refreshState],
+  )
+
+  // The Edit view applies its staged copy: it replaces the conversation and
+  // each change becomes an edit-log line.
+  const applyStagedSession = useCallback(
+    (nextSession, lines) => {
+      setSession(nextSession)
+      lines.forEach(logEdit)
+    },
+    [logEdit],
+  )
 
   const refreshState = useCallback(async () => {
     const data = await getState()
@@ -209,6 +247,7 @@ export default function App() {
           type === 'model.unloaded' ||
           type === 'model.error' ||
           type === 'cache.clear' ||
+          type === 'cache.delete' ||
           type === 'cache.evict'
         ) {
           refreshState().catch(() => {})
@@ -273,6 +312,10 @@ export default function App() {
     pendingTurnRef.current = null
     const answer = (generation.channels?.answer || '').trim()
     const submitted = generation.session
+    // The edits applied since the last turn belong to this one.
+    const edits = pendingEditsRef.current
+    pendingEditsRef.current = []
+    setPendingEdits([])
     setSession({
       ...submitted,
       messages: answer
@@ -291,6 +334,7 @@ export default function App() {
         thinking: (generation.tokens || []).filter((token) => token.channel === 'thinking').length,
         context: generation.prompt,
         cache: null,
+        edits,
       },
     ])
     ;(async () => {
@@ -327,6 +371,12 @@ export default function App() {
     try {
       const data = await putConfig(patch)
       setState(data)
+      if ('cache_reuse' in patch) {
+        logEdit(`turned cache reuse ${patch.cache_reuse ? 'on' : 'off'}`)
+      }
+      if ('cache_checkpoints' in patch) {
+        logEdit(`changed cache checkpoints to ${patch.cache_checkpoints}`)
+      }
     } catch (error) {
       setConfigError(formatError(error.detail || error))
     } finally {
@@ -361,7 +411,10 @@ export default function App() {
   async function handleClearCache() {
     setSaving(true)
     try {
-      setState(await clearCache())
+      const before = state.cache?.entries_count ?? 0
+      const data = await clearCache()
+      setState(data)
+      logEdit(`cleared the cache (${before} ${before === 1 ? 'entry' : 'entries'})`)
     } catch (error) {
       setActionError(formatError(error.detail || error))
     } finally {
@@ -554,8 +607,13 @@ export default function App() {
                       draft={draft}
                       turns={turns}
                       modelLoaded={modelLoaded}
+                      running={running}
                       viewTurn={viewTurn}
                       prevTurn={prevTurn}
+                      pendingEdits={pendingEdits}
+                      systemPrompt={state.config?.system_prompt || ''}
+                      onApplyStaged={applyStagedSession}
+                      onCacheAction={runCacheAction}
                     />
                   </div>
                 </Panel>
@@ -571,6 +629,9 @@ export default function App() {
                       onClearCache={handleClearCache}
                       viewTurn={viewTurn}
                       prevTurn={prevTurn}
+                      pendingEdits={pendingEdits}
+                      onConfigChange={updateConfig}
+                      onCacheAction={runCacheAction}
                     />
                   </div>
                 </Panel>

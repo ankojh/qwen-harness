@@ -210,6 +210,144 @@ def _effective_settings(
     }
 
 
+def prefill_to(
+    *,
+    model: Any,
+    tokens: list[int],
+    cache: Any,
+    start: int,
+    end: int,
+    config: AppConfig,
+    emit: Callable[[str, dict[str, Any]], Any],
+    cancel: threading.Event | None,
+    counters: dict[str, int],
+    stream: Any,
+    gen_id: str | None = None,
+    planned_checkpoints: list[dict[str, Any]] | None = None,
+    cache_store: PromptCacheStore | None = None,
+    compat_key: tuple | None = None,
+) -> dict[str, Any]:
+    """Feed ``tokens[start:end]`` to the model in ``prefill_step_size`` chunks.
+
+    The chunked prefill loop, shared by ``run_generation`` and the manual
+    checkpoint endpoint, so both feed the model identically.  Each chunk ends
+    exactly at the next planned checkpoint (a clean token boundary), emits
+    one ``prefill.chunk`` event, and snapshots planned checkpoints exactly
+    where a generation would.  Returns prefill stats plus a cancelled flag.
+    """
+    planned = planned_checkpoints or []
+    prefill_started = time.perf_counter()
+    prefill_seconds = 0.0
+    chunks = 0
+    processed = 0
+    cancelled = False
+    with mx.stream(stream):
+        offset = start
+        while offset < end:
+            if cancel is not None and cancel.is_set():
+                cancelled = True
+                break
+            step = min(config.prefill_step_size, end - offset)
+            # End this chunk exactly at the next checkpoint so the snapshot
+            # is a clean token boundary.
+            next_position = next(
+                (
+                    item["position"]
+                    for item in planned
+                    if item["position"] is not None and item["position"] > offset
+                ),
+                None,
+            )
+            if next_position is not None and next_position < offset + step:
+                step = next_position - offset
+            chunk_started = time.perf_counter()
+            model(mx.array(tokens[offset : offset + step], dtype=mx.int32)[None], cache=cache)
+            maybe_quantize_kv_cache(
+                cache,
+                quantized_kv_start=config.quantized_kv_start,
+                kv_group_size=config.kv_group_size,
+                kv_bits=config.kv_bits,
+            )
+            mx.eval([item.state for item in cache])
+            mx.clear_cache()
+            chunk_seconds = time.perf_counter() - chunk_started
+            prefill_seconds += chunk_seconds
+            offset += step
+            processed += step
+            chunks += 1
+            counters["forward_calls_total"] += 1
+            emit(
+                "prefill.chunk",
+                {
+                    "generation_id": gen_id,
+                    "chunk_tokens": step,
+                    "processed_tokens": processed,
+                    "total_tokens": end - start,
+                    "reused_tokens": start,
+                    "seconds": round(chunk_seconds, 4),
+                    "tokens_per_second": (
+                        round(step / chunk_seconds, 1) if chunk_seconds else None
+                    ),
+                },
+            )
+            for entry in planned:
+                if entry["position"] != offset:
+                    continue
+                position = entry["position"]
+                key = tokens[:position]
+                existing = cache_store.touch_exact(key, compat_key)
+                if existing is not None:
+                    emit(
+                        "cache.checkpoint",
+                        {
+                            "generation_id": gen_id,
+                            "after_message": entry["after_message"],
+                            "position": position,
+                            "used_existing": True,
+                            "detail": (
+                                "an identical entry is already stored; marked used "
+                                "instead of copying the cache again"
+                            ),
+                            **existing,
+                        },
+                    )
+                    continue
+                snapshot_started = time.perf_counter()
+                snapshot = copy.deepcopy(cache)
+                info = cache_store.insert(
+                    key,
+                    snapshot,
+                    "checkpoint",
+                    compat_key,
+                    max_entries=config.cache_max_entries,
+                    max_bytes=int(config.cache_max_gb * 1_000_000_000),
+                    after_message=entry["after_message"],
+                )
+                emit(
+                    "cache.checkpoint",
+                    {
+                        "generation_id": gen_id,
+                        "after_message": entry["after_message"],
+                        "position": position,
+                        "used_existing": False,
+                        "seconds": round(
+                            time.perf_counter() - snapshot_started, 4
+                        ),
+                        **info,
+                    },
+                )
+    return {
+        "processed_tokens": processed,
+        "chunks": chunks,
+        "seconds": round(prefill_seconds, 4),
+        "wall_seconds": round(time.perf_counter() - prefill_started, 4),
+        "tokens_per_second": (
+            round(processed / prefill_seconds, 1) if prefill_seconds else None
+        ),
+        "cancelled": cancelled,
+    }
+
+
 def run_generation(
     *,
     gen_id: str,
@@ -350,8 +488,10 @@ def run_generation(
                 "kind": None,
                 "entry_tokens": 0,
                 "reused_tokens": 0,
+                "relabeled": False,
                 "reason": "cache_reuse is off",
             }
+            cache_store.note_lookup(lookup)
         emit(
             "cache.lookup",
             {
@@ -389,110 +529,30 @@ def run_generation(
                 key=lambda item: item["position"],
             )
         prefill_started = time.perf_counter()
-        prefill_seconds = 0.0
-        chunks = 0
-        processed = 0
         mx.reset_peak_memory()
         if config.seed is not None:
             mx.random.seed(config.seed)
 
-        cancelled = False
-        with mx.stream(generation_stream):
-            offset = reused
-            while offset < feed_end:
-                if cancel.is_set():
-                    cancelled = True
-                    break
-                step = min(config.prefill_step_size, feed_end - offset)
-                # End this chunk exactly at the next checkpoint so the snapshot
-                # is a clean token boundary.
-                next_position = next(
-                    (
-                        item["position"]
-                        for item in planned_checkpoints
-                        if item["position"] > offset
-                    ),
-                    None,
-                )
-                if next_position is not None and next_position < offset + step:
-                    step = next_position - offset
-                chunk_started = time.perf_counter()
-                model(mx.array(tokens[offset : offset + step], dtype=mx.int32)[None], cache=cache)
-                maybe_quantize_kv_cache(
-                    cache,
-                    quantized_kv_start=config.quantized_kv_start,
-                    kv_group_size=config.kv_group_size,
-                    kv_bits=config.kv_bits,
-                )
-                mx.eval([item.state for item in cache])
-                mx.clear_cache()
-                chunk_seconds = time.perf_counter() - chunk_started
-                prefill_seconds += chunk_seconds
-                offset += step
-                processed += step
-                chunks += 1
-                counters["forward_calls_total"] += 1
-                emit(
-                    "prefill.chunk",
-                    {
-                        "generation_id": gen_id,
-                        "chunk_tokens": step,
-                        "processed_tokens": processed,
-                        "total_tokens": feed_end - reused,
-                        "reused_tokens": reused,
-                        "seconds": round(chunk_seconds, 4),
-                        "tokens_per_second": (
-                            round(step / chunk_seconds, 1) if chunk_seconds else None
-                        ),
-                    },
-                )
-                for entry in planned_checkpoints:
-                    if entry["position"] != offset:
-                        continue
-                    position = entry["position"]
-                    key = tokens[:position]
-                    existing = cache_store.touch_exact(key, compat_key)
-                    if existing is not None:
-                        emit(
-                            "cache.checkpoint",
-                            {
-                                "generation_id": gen_id,
-                                "after_message": entry["after_message"],
-                                "position": position,
-                                "used_existing": True,
-                                "detail": (
-                                    "an identical entry is already stored; marked used "
-                                    "instead of copying the cache again"
-                                ),
-                                **existing,
-                            },
-                        )
-                        continue
-                    snapshot_started = time.perf_counter()
-                    snapshot = copy.deepcopy(cache)
-                    info = cache_store.insert(
-                        key,
-                        snapshot,
-                        "checkpoint",
-                        compat_key,
-                        max_entries=config.cache_max_entries,
-                        max_bytes=int(config.cache_max_gb * 1_000_000_000),
-                        after_message=entry["after_message"],
-                    )
-                    emit(
-                        "cache.checkpoint",
-                        {
-                            "generation_id": gen_id,
-                            "after_message": entry["after_message"],
-                            "position": position,
-                            "used_existing": False,
-                            "seconds": round(
-                                time.perf_counter() - snapshot_started, 4
-                            ),
-                            **info,
-                        },
-                    )
-
+        prefill = prefill_to(
+            model=model,
+            tokens=tokens,
+            cache=cache,
+            start=reused,
+            end=feed_end,
+            config=config,
+            emit=emit,
+            cancel=cancel,
+            counters=counters,
+            stream=generation_stream,
+            gen_id=gen_id,
+            planned_checkpoints=planned_checkpoints,
+            cache_store=cache_store,
+            compat_key=compat_key,
+        )
+        cancelled = prefill["cancelled"]
+        prefill_seconds = prefill["seconds"]
+        chunks = prefill["chunks"]
+        processed = prefill["processed_tokens"]
         prefill_total_seconds = time.perf_counter() - prefill_started
         generations.update(gen_id, phase="decode" if not cancelled else "done")
 

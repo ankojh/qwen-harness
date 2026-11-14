@@ -92,6 +92,16 @@ def _tokenize(tokenizer: Any, text: str) -> list[int]:
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
+def relabel_token_ids(tokenizer: Any, text: str) -> list[int]:
+    """Tokenize ``text`` without special tokens, for a cache relabel.
+
+    A relabel replaces exactly one stored token, so callers reject any text
+    whose tokenization is not a single id (the store keeps the token count
+    intact; only the id at one position changes).
+    """
+    return list(tokenizer.encode(text, add_special_tokens=False))
+
+
 def _token_text(tokenizer: Any, token_id: int, piece: str) -> str:
     """The token's own decoded text (best effort; falls back to the piece)."""
     try:
@@ -223,6 +233,53 @@ def _prefix_position(
     if len(prefix_ids) >= len(full_ids):
         return None, "prefix covers the whole prompt, leaving no token to feed"
     return len(prefix_ids), None
+
+
+def checkpoint_boundary(
+    *,
+    template_messages: list[dict[str, Any]],
+    token_ids: list[int],
+    config: AppConfig,
+    tokenizer: Any,
+    thinking_supported: bool,
+    template_kwargs: dict[str, Any],
+    after_message: int,
+) -> dict[str, Any]:
+    """The token boundary at the end of submitted message ``after_message``.
+
+    The same computation ``build_prompt`` uses for its checkpoint table:
+    render the first ``after_message`` template messages WITHOUT the assistant
+    generation prompt, then check that the result is a real token prefix of
+    the full prompt.  ``POST /api/cache/checkpoint`` reuses this so a manual
+    checkpoint is always the same boundary the automatic one would store.
+    Returns ``{"position", "ok", "reason"}``.
+    """
+    entry: dict[str, Any] = {
+        "position": None,
+        "ok": False,
+        "reason": None,
+    }
+    try:
+        prefix_text = _render(
+            template_messages[:after_message],
+            config,
+            tokenizer,
+            add_generation_prompt=False,
+            pass_thinking=thinking_supported,
+            template_kwargs=template_kwargs,
+        )
+        prefix_ids = _tokenize(tokenizer, prefix_text)
+    except Exception as exc:  # noqa: BLE001 - a failed boundary is reported
+        entry["reason"] = (
+            f"chat template failed for this prefix: {type(exc).__name__}: {exc}"
+        )
+        return entry
+    position, reason = _prefix_position(prefix_ids, token_ids)
+    if position is None:
+        entry["reason"] = reason
+    else:
+        entry.update(position=position, ok=True)
+    return entry
 
 
 def _build_message_list(
@@ -579,39 +636,27 @@ def build_prompt(
         )
         previous = 0
         for index in indices:
-            entry: dict[str, Any] = {
-                "after_message": index,
-                "position": None,
-                "ok": False,
-                "reason": None,
-            }
-            try:
-                prefix_text = _render(
-                    template_messages[:index],
-                    config,
-                    tokenizer,
-                    add_generation_prompt=False,
-                    pass_thinking=thinking_supported,
-                    template_kwargs=template_kwargs,
+            boundary = checkpoint_boundary(
+                template_messages=template_messages,
+                token_ids=token_ids,
+                config=config,
+                tokenizer=tokenizer,
+                thinking_supported=thinking_supported,
+                template_kwargs=template_kwargs,
+                after_message=index,
+            )
+            entry: dict[str, Any] = {"after_message": index, **boundary}
+            position = entry["position"]
+            if entry["ok"] and position <= previous:
+                entry.update(
+                    position=None,
+                    ok=False,
+                    reason=(
+                        f"position {position} is not longer than the previous "
+                        f"accepted position {previous}"
+                    ),
                 )
-                prefix_ids = _tokenize(tokenizer, prefix_text)
-            except Exception as exc:  # noqa: BLE001 - a skipped boundary is reported
-                entry["reason"] = (
-                    f"chat template failed for this prefix: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                checkpoints.append(entry)
-                continue
-            position, reason = _prefix_position(prefix_ids, token_ids)
-            if position is None:
-                entry["reason"] = reason
-            elif position <= previous:
-                entry["reason"] = (
-                    f"position {position} is not longer than the previous accepted "
-                    f"position {previous}"
-                )
-            else:
-                entry.update(position=position, ok=True)
+            elif entry["ok"]:
                 previous = position
             checkpoints.append(entry)
         checkpoint_at = previous or None

@@ -1,12 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import TokenChips from './TokenChips.jsx'
-import { diffContexts, messageOf } from './turnDiffs.js'
+import { commonPrefix, diffContexts, messageOf, stopsMatching } from './turnDiffs.js'
+import { formatError, getCacheTokens, previewPrompt, saveCheckpoint } from './api.js'
 
-// The context: what the viewed request sends, message by message.  Three
+// The context: what the viewed request sends, message by message.  Four
 // views: Overview (the summary as before), Tokens (every token as a chip,
 // grouped by message, plus a per-message word/token table), Changes (what
-// this request changed versus the previous turn).  A historical turn shows
-// its recorded snapshot; "Next" shows the live tokenizer-only preview.
+// this request changed versus the previous turn, plus the edits applied
+// before it), and Edit (a staged copy of the conversation with per-message
+// operations and a consequences card; only for "Next").  A historical turn
+// shows its recorded snapshot and stays read-only.
 
 function oneLine(text, limit = 90) {
   const flat = (text || '').replace(/\s+/g, ' ').trim()
@@ -35,6 +38,36 @@ function templateTokens(span, pieces) {
 function spanLabel(span) {
   if (span.kind === 'opener') return `assistant opener · ${span.end - span.start} tokens`
   return `${span.role} · ${span.end - span.start} tokens`
+}
+
+// One edit-log line per message-level change when the staged copy is applied.
+function describeChanges(before, after) {
+  const lines = []
+  const length = Math.max(before.length, after.length)
+  for (let index = 0; index < length; index += 1) {
+    const prev = before[index]
+    const next = after[index]
+    const label = `message #${index + 1}`
+    if (prev && next && prev !== next) {
+      const changes = []
+      if (prev.content !== next.content) {
+        changes.push(`${JSON.stringify(oneLine(prev.content, 30))} → ${JSON.stringify(oneLine(next.content, 30))}`)
+      }
+      if (prev.role !== next.role) changes.push(`role ${prev.role} → ${next.role}`)
+      if ((prev.enabled !== false) !== (next.enabled !== false)) {
+        changes.push(next.enabled === false ? 'switched off' : 'switched on')
+      }
+      if ((prev.reasoning_content || '') !== (next.reasoning_content || '')) {
+        changes.push(next.reasoning_content ? 'reasoning set' : 'reasoning removed')
+      }
+      if (changes.length) lines.push(`edited ${label} (${next.role}): ${changes.join(', ')}`)
+    } else if (prev && !next) {
+      lines.push(`deleted ${label} (${prev.role}) “${oneLine(prev.content, 40)}”`)
+    } else if (!prev && next) {
+      lines.push(`inserted ${label} (${next.role}) “${oneLine(next.content, 40)}”`)
+    }
+  }
+  return lines
 }
 
 function PromptMap({ spans, reused, total }) {
@@ -277,21 +310,375 @@ function DiffRow({ row, report, prevReport }) {
   }
 }
 
-function ChangesView({ report, prevTurn }) {
-  if (!prevTurn || !prevTurn.context) {
-    return <p className="muted">First turn — nothing to compare.</p>
-  }
-  const diff = diffContexts(prevTurn.context, report, prevTurn.thinking || 0)
+function EditLog({ edits, historical }) {
+  const label = historical ? 'Before this turn you' : 'So far, before the next turn you'
+  return (
+    <div className="change-row edit-log">
+      <strong>{label}:</strong>
+      {edits && edits.length > 0 ? (
+        <ul>
+          {edits.map((line, index) => (
+            <li key={index}>{line}</li>
+          ))}
+        </ul>
+      ) : (
+        <div className="muted">nothing was edited</div>
+      )}
+    </div>
+  )
+}
+
+function ChangesView({ report, prevTurn, editLog, historical }) {
   return (
     <div className="change-list">
-      <p className="muted">
-        Common prefix {diff.commonPrefix} tokens ·{' '}
-        {diff.prevTokens} → {diff.nextTokens} tokens (net {diff.netChange >= 0 ? '+' : ''}{diff.netChange}) ·{' '}
-        thinking from turn {prevTurn.n} not carried: {diff.thinkingNotCarried} tokens
-      </p>
-      {diff.rows.map((row, key) => (
-        <DiffRow key={key} row={row} report={report} prevReport={prevTurn.context} />
-      ))}
+      <EditLog edits={editLog} historical={historical} />
+      {!prevTurn || !prevTurn.context ? (
+        <p className="muted">First turn — nothing to compare.</p>
+      ) : (
+        <>
+          {(() => {
+            const diff = diffContexts(prevTurn.context, report, prevTurn.thinking || 0)
+            return (
+              <>
+                <p className="muted">
+                  Common prefix {diff.commonPrefix} tokens ·{' '}
+                  {diff.prevTokens} → {diff.nextTokens} tokens (net {diff.netChange >= 0 ? '+' : ''}{diff.netChange}) ·{' '}
+                  thinking from turn {prevTurn.n} not carried: {diff.thinkingNotCarried} tokens
+                </p>
+                {diff.rows.map((row, key) => (
+                  <DiffRow key={key} row={row} report={report} prevReport={prevTurn.context} />
+                ))}
+              </>
+            )
+          })()}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- Edit view
+function InsertRow({ position, onInsert, disabled }) {
+  return (
+    <div className="edit-insert">
+      <button
+        type="button"
+        className="mini"
+        disabled={disabled}
+        onClick={() => onInsert(position)}
+      >
+        + insert message here
+      </button>
+    </div>
+  )
+}
+
+function ConsequencesCard({
+  preview,
+  stagedSession,
+  stagedPreview,
+  stagedPreviewError,
+  cacheTokens,
+  busy,
+  onApply,
+  onDiscard,
+}) {
+  const nowReport = preview
+  const nowIds = nowReport?.token_ids || []
+  const afterIds = stagedPreview?.token_ids || []
+  const nowTokens = nowReport?.budget?.input_tokens ?? nowIds.length
+  const afterTokens = stagedPreview?.budget?.input_tokens ?? afterIds.length
+  const nowReuse = nowReport?.cache_prediction?.reused_tokens || 0
+  const nowEntry = nowReport?.cache_prediction?.entry_id
+  const afterReuse = stagedPreview?.cache_prediction?.reused_tokens || 0
+  const afterEntry = stagedPreview?.cache_prediction?.entry_id
+  const firstDiff = commonPrefix(nowIds, afterIds)
+  const changed = firstDiff < Math.max(nowIds.length, afterIds.length)
+  const stops = stopsMatching(cacheTokens, nowIds, afterIds)
+  const reuse = (tokens, entry) => (tokens > 0 ? `${tokens} (#${entry})` : '0')
+  return (
+    <div className="edit-consequences">
+      <strong>If you apply these edits</strong>
+      {stagedPreviewError && <p className="note note-error">{stagedPreviewError}</p>}
+      <div className="table-scroll">
+        <table className="data-table">
+          <thead>
+            <tr><th></th><th>Now</th><th>After edits</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Tokens in next request</td>
+              <td>{nowTokens}</td>
+              <td>{afterTokens}</td>
+            </tr>
+            <tr>
+              <td>Reused from cache</td>
+              <td>{reuse(nowReuse, nowEntry)}</td>
+              <td>{reuse(afterReuse, afterEntry)}</td>
+            </tr>
+            <tr>
+              <td>First changed token</td>
+              <td>—</td>
+              <td>
+                {!nowIds.length && !afterIds.length
+                  ? '—'
+                  : changed
+                    ? `position ${firstDiff}`
+                    : 'none (identical tokens)'}
+              </td>
+            </tr>
+            <tr>
+              <td>Entries that stop matching</td>
+              <td>—</td>
+              <td>
+                {stops.length === 0 ? (
+                  'none'
+                ) : (
+                  stops.map(({ entry, divergence, extendsBeyond }) => (
+                    <div key={entry.id} className="badge badge-warn">
+                      #{entry.id} {entry.kind}{entry.after_message ? ` after message ${entry.after_message}` : ''} ·{' '}
+                      {extendsBeyond
+                        ? `the request ends at token ${divergence}`
+                        : `diverges at token ${divergence}`}
+                    </div>
+                  ))
+                )}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="chips-wrap">
+        <button type="button" className="primary" disabled={busy} onClick={onApply}>Apply</button>
+        <button type="button" disabled={busy} onClick={onDiscard}>Discard</button>
+        {busy && <span className="muted small">wait for the generation to finish</span>}
+      </div>
+    </div>
+  )
+}
+
+function EditView({
+  session,
+  staged,
+  setStaged,
+  preview,
+  systemPrompt,
+  modelLoaded,
+  busy,
+  onApplyStaged,
+  onCacheAction,
+  onLeave,
+}) {
+  const [stagedPreview, setStagedPreview] = useState(null)
+  const [stagedPreviewError, setStagedPreviewError] = useState(null)
+  const [cacheTokens, setCacheTokens] = useState([])
+  const [checkpointBusy, setCheckpointBusy] = useState(false)
+
+  const stagedSession = useMemo(
+    () => (staged ? { mode: 'messages', messages: staged } : null),
+    [staged],
+  )
+
+  // Consequences card: preview the staged session (tokenizer only) and the
+  // live cache token lists, debounced like the main preview.
+  useEffect(() => {
+    if (!stagedSession || !modelLoaded) {
+      setStagedPreview(null)
+      setStagedPreviewError(null)
+      setCacheTokens([])
+      return undefined
+    }
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      try {
+        const [report, tokenLists] = await Promise.all([
+          previewPrompt(stagedSession),
+          getCacheTokens(),
+        ])
+        if (!cancelled) {
+          setStagedPreview(report)
+          setStagedPreviewError(null)
+          setCacheTokens(tokenLists.entries || [])
+        }
+      } catch (error) {
+        if (!cancelled) setStagedPreviewError(formatError(error.detail || error))
+      }
+    }, 300)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [stagedSession, modelLoaded])
+
+  function update(index, patch) {
+    setStaged(staged.map((message, position) =>
+      position === index ? { ...message, ...patch } : message,
+    ))
+  }
+
+  function move(index, direction) {
+    const target = index + direction
+    if (target < 0 || target >= staged.length) return
+    const next = [...staged]
+    ;[next[index], next[target]] = [next[target], next[index]]
+    setStaged(next)
+  }
+
+  function removeAt(index) {
+    setStaged(staged.filter((_, position) => position !== index))
+  }
+
+  function insert(position) {
+    setStaged([
+      ...staged.slice(0, position),
+      { role: 'user', content: '', reasoning_content: null, enabled: true },
+      ...staged.slice(position),
+    ])
+  }
+
+  function addSystem() {
+    setStaged([
+      { role: 'system', content: '', reasoning_content: null, enabled: true },
+      ...staged,
+    ])
+  }
+
+  // The checkpoint boundary number uses the same numbering the server's
+  // checkpoint table uses: submitted messages (enabled only), with the
+  // configured system prompt as message 1 when set.
+  function submittedIndexOf(index) {
+    const before = staged.slice(0, index).filter((message) => message.enabled !== false).length
+    return before + 1 + (systemPrompt ? 1 : 0)
+  }
+
+  function checkpointAt(index) {
+    const afterMessage = submittedIndexOf(index)
+    setCheckpointBusy(true)
+    onCacheAction(
+      () => saveCheckpoint(stagedSession, afterMessage),
+      (result) =>
+        result.used_existing
+          ? `saved a checkpoint after message ${afterMessage}: entry #${result.entry_id} already held it (marked used)`
+          : `saved a checkpoint after message ${afterMessage}: entry #${result.entry_id}, ${result.tokens} tokens`,
+    )
+      .catch(() => {})
+      .finally(() => setCheckpointBusy(false))
+  }
+
+  const changedAt = (index) => {
+    const prev = session.messages[index]
+    const next = staged[index]
+    if (!prev || !next) return true
+    return (
+      prev.content !== next.content ||
+      prev.role !== next.role ||
+      (prev.enabled !== false) !== (next.enabled !== false) ||
+      (prev.reasoning_content || '') !== (next.reasoning_content || '')
+    )
+  }
+
+  function handleApply() {
+    const lines = describeChanges(session.messages, staged)
+    onApplyStaged({ mode: 'messages', messages: staged }, lines)
+    onLeave('overview')
+  }
+
+  function handleDiscard() {
+    onLeave('overview')
+  }
+
+  return (
+    <div className="edit-view">
+      <div className="row-between">
+        <span className="muted small">
+          Edits are staged: the live conversation does not change until you Apply.
+        </span>
+        <button type="button" className="mini" disabled={busy} onClick={addSystem}>
+          + system message
+        </button>
+      </div>
+      {systemPrompt && (
+        <p className="muted small">
+          Note: the configured system prompt (“{oneLine(systemPrompt, 40)}”) is inserted as
+          message 1 by the server, before these messages.
+        </p>
+      )}
+      <ol className="edit-messages">
+        {staged.map((message, index) => (
+          <li key={index}>
+            <InsertRow position={index} onInsert={insert} disabled={busy} />
+            <div className={`edit-message ${changedAt(index) ? 'changed' : ''}`}>
+              <div className="edit-message-head">
+                <select
+                  value={message.role}
+                  disabled={busy}
+                  onChange={(event) => update(index, { role: event.target.value })}
+                >
+                  <option value="system">system</option>
+                  <option value="user">user</option>
+                  <option value="assistant">assistant</option>
+                </select>
+                <span className="muted">#{index + 1}</span>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={message.enabled !== false}
+                    disabled={busy}
+                    onChange={(event) => update(index, { enabled: event.target.checked })}
+                  />
+                  on
+                </label>
+                {changedAt(index) && <span className="badge badge-warn">edited</span>}
+                <span className="spacer" />
+                <button type="button" className="mini" disabled={busy || index === 0} onClick={() => move(index, -1)}>↑</button>
+                <button type="button" className="mini" disabled={busy || index === staged.length - 1} onClick={() => move(index, 1)}>↓</button>
+                <button type="button" className="mini danger" disabled={busy} onClick={() => removeAt(index)}>✕</button>
+                <button
+                  type="button"
+                  className="mini"
+                  disabled={busy || checkpointBusy || message.enabled === false}
+                  title={
+                    message.enabled === false
+                      ? 'disabled messages are not sent, so there is no boundary after them'
+                      : `snapshot the cache at the end of this message (server message ${submittedIndexOf(index)})`
+                  }
+                  onClick={() => checkpointAt(index)}
+                >
+                  save checkpoint
+                </button>
+              </div>
+              <textarea
+                rows={2}
+                value={message.content}
+                disabled={busy}
+                placeholder="content"
+                onChange={(event) => update(index, { content: event.target.value })}
+              />
+              {message.role === 'assistant' && (
+                <textarea
+                  rows={2}
+                  className="reasoning"
+                  value={message.reasoning_content || ''}
+                  disabled={busy}
+                  placeholder="reasoning_content (the chat template drops it from history)"
+                  onChange={(event) => update(index, { reasoning_content: event.target.value })}
+                />
+              )}
+            </div>
+          </li>
+        ))}
+        <InsertRow position={staged.length} onInsert={insert} disabled={busy} />
+      </ol>
+      <ConsequencesCard
+        preview={preview}
+        stagedSession={stagedSession}
+        stagedPreview={stagedPreview}
+        stagedPreviewError={stagedPreviewError}
+        cacheTokens={cacheTokens}
+        busy={busy}
+        onApply={handleApply}
+        onDiscard={handleDiscard}
+      />
     </div>
   )
 }
@@ -303,15 +690,80 @@ export default function ContextPanel({
   draft,
   turns,
   modelLoaded,
+  running,
   viewTurn,
   prevTurn,
+  pendingEdits,
+  systemPrompt,
+  onApplyStaged,
+  onCacheAction,
 }) {
   const [view, setView] = useState('overview')
+  const [staged, setStaged] = useState(null)
   const historical = Boolean(viewTurn)
   const report = historical ? viewTurn.context : preview
+  // Editing is only for "Next", and never while a generation runs.
+  const effectiveView = view === 'edit' && (historical || running) ? 'overview' : view
+  const editLog = historical ? viewTurn.edits || [] : pendingEdits || []
+
+  function enterEdit() {
+    setStaged(session.messages.map((message) => ({ ...message })))
+    setView('edit')
+  }
+
+  function leaveEdit(nextView) {
+    setStaged(null)
+    setView(nextView)
+  }
 
   if (!modelLoaded) return <p className="muted">Load the model to see the context.</p>
   if (historical && !report) return <p className="muted">This turn recorded no context.</p>
+
+  if (effectiveView === 'edit') {
+    return (
+      <div className="context-panel">
+        <div className="ctx-headline">
+          <span className="big-num">{session.messages.length}</span>
+          <span className="muted">
+            messages in the conversation · editing a staged copy
+          </span>
+        </div>
+        <div className="tabs" role="tablist">
+          {[
+            ['overview', 'Overview'],
+            ['tokens', 'Tokens'],
+            ['changes', 'Changes'],
+            ['edit', 'Edit'],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              className={effectiveView === id ? 'active' : ''}
+              disabled={id === 'edit' && running}
+              title={id === 'edit' && running ? 'wait for the generation to finish' : undefined}
+              onClick={() => (id === 'edit' ? enterEdit() : setView(id))}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <EditView
+          session={session}
+          staged={staged}
+          setStaged={setStaged}
+          preview={preview}
+          systemPrompt={systemPrompt}
+          modelLoaded={modelLoaded}
+          busy={running}
+          onApplyStaged={onApplyStaged}
+          onCacheAction={onCacheAction}
+          onLeave={leaveEdit}
+        />
+      </div>
+    )
+  }
+
   if (!historical && session.messages.length === 0 && !draft.trim()) {
     return (
       <p className="muted">
@@ -345,13 +797,16 @@ export default function ContextPanel({
         ['overview', 'Overview'],
         ['tokens', 'Tokens'],
         ['changes', 'Changes'],
+        ...(historical ? [] : [['edit', 'Edit']]),
       ].map(([id, label]) => (
         <button
           key={id}
           type="button"
           role="tab"
-          className={view === id ? 'active' : ''}
-          onClick={() => setView(id)}
+          className={effectiveView === id ? 'active' : ''}
+          disabled={id === 'edit' && running}
+          title={id === 'edit' && running ? 'wait for the generation to finish' : undefined}
+          onClick={() => (id === 'edit' ? enterEdit() : setView(id))}
         >
           {label}
         </button>
@@ -359,7 +814,7 @@ export default function ContextPanel({
     </div>
   )
 
-  if (view === 'tokens') {
+  if (effectiveView === 'tokens') {
     return (
       <div className="context-panel">
         <div className="ctx-headline">
@@ -374,7 +829,7 @@ export default function ContextPanel({
     )
   }
 
-  if (view === 'changes') {
+  if (effectiveView === 'changes') {
     return (
       <div className="context-panel">
         <div className="ctx-headline">
@@ -385,7 +840,12 @@ export default function ContextPanel({
           </span>
         </div>
         {tabs}
-        <ChangesView report={report} prevTurn={prevTurn} />
+        <ChangesView
+          report={report}
+          prevTurn={prevTurn}
+          editLog={editLog}
+          historical={historical}
+        />
       </div>
     )
   }

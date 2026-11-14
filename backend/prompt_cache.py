@@ -48,7 +48,7 @@ class CacheEntry:
     id: int
     tokens: list[int]
     cache: list[Any]
-    kind: str  # "checkpoint" or "after-generation"
+    kind: str  # "checkpoint", "manual" or "after-generation"
     compat_key: tuple
     nbytes: int
     arrays_bytes: int = 0  # recurrent state of the 24 linear-attention layers
@@ -56,6 +56,10 @@ class CacheEntry:
     after_message: int | None = None  # only for checkpoints
     created: float = field(default_factory=time.time)
     last_used: int = 0
+    # Token relabels: {position, original_id, new_id}.  A relabelled entry
+    # claims different tokens than the state it stores; the first original id
+    # for a position is kept when it is relabelled again.
+    relabels: list[dict[str, int]] = field(default_factory=list)
 
 
 BYTE_NOTE = (
@@ -333,6 +337,7 @@ class PromptCacheStore:
             "entry_tokens": len(entry.tokens) if entry else 0,
             "reused_tokens": found["reuse_tokens"],
             "would_trim": found["trim_by"],
+            "relabeled": bool(entry and entry.relabels),
             "reason": reason,
         }
 
@@ -351,6 +356,7 @@ class PromptCacheStore:
                 "kind": entry.kind if entry else None,
                 "entry_tokens": len(entry.tokens) if entry else 0,
                 "reused_tokens": 0,
+                "relabeled": False,
                 "reason": found["reason"],
             }
             self.last_lookup = info
@@ -369,6 +375,7 @@ class PromptCacheStore:
             "entry_tokens": len(entry.tokens),
             "reused_tokens": reuse,
             "trimmed": trim_by,
+            "relabeled": bool(entry.relabels),
             "reason": (
                 f"reused {reuse} tokens from {entry.kind} entry #{entry.id}"
                 + (f" after trimming {trim_by}" if trim_by else "")
@@ -461,6 +468,11 @@ class PromptCacheStore:
             info["entries"] = len(self._entries)
             info["total_bytes"] = self._total_bytes
         return info
+
+    @_locked
+    def note_lookup(self, info: dict[str, Any]) -> None:
+        """Record a lookup that never touched an entry (reuse off, say)."""
+        self.last_lookup = info
 
     @_locked
     def touch_exact(self, tokens: list[int], compat_key: tuple) -> dict[str, Any] | None:
@@ -558,6 +570,92 @@ class PromptCacheStore:
                 return entry
         return None
 
+    # ------------------------------------------------------------- editing
+    @_locked
+    def remove(self, entry_id: int) -> dict[str, Any] | None:
+        """Delete one entry and emit ``cache.delete``.  Returns None if absent."""
+        for index, entry in enumerate(self._entries):
+            if entry.id != entry_id:
+                continue
+            self._entries.pop(index)
+            self._total_bytes -= entry.nbytes
+            info = {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "after_message": entry.after_message,
+                "tokens": len(entry.tokens),
+                "nbytes": entry.nbytes,
+                "arrays_bytes": entry.arrays_bytes,
+                "kv_bytes": entry.kv_bytes,
+                "relabels": len(entry.relabels),
+                "entries": len(self._entries),
+                "total_bytes": self._total_bytes,
+                "evictions_total": self._evictions,
+            }
+            self._emit("cache.delete", info)
+            return info
+        return None
+
+    @_locked
+    def relabel(
+        self, entry_id: int, position: int, new_id: int
+    ) -> dict[str, Any] | None:
+        """Replace entry token ``position`` with ``new_id`` and record it.
+
+        The caller is responsible for validating the position and that
+        ``new_id`` is a single token.  The token count never changes, so the
+        KV offsets in the stored state still line up.  Returns None if the
+        entry is absent.
+        """
+        for entry in self._entries:
+            if entry.id != entry_id:
+                continue
+            previous = next(
+                (item for item in entry.relabels if item["position"] == position),
+                None,
+            )
+            if previous is not None:
+                # Keep the first original for a position relabelled twice.
+                original_id = previous["original_id"]
+                previous["new_id"] = new_id
+            else:
+                original_id = entry.tokens[position]
+                entry.relabels.append(
+                    {
+                        "position": position,
+                        "original_id": original_id,
+                        "new_id": new_id,
+                    }
+                )
+            entry.tokens[position] = new_id
+            return {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "position": position,
+                "original_id": original_id,
+                "new_id": new_id,
+                "relabels": len(entry.relabels),
+            }
+        return None
+
+    @_locked
+    def restore(self, entry_id: int) -> dict[str, Any] | None:
+        """Put the original token ids back and clear ``relabels``."""
+        for entry in self._entries:
+            if entry.id != entry_id:
+                continue
+            for item in entry.relabels:
+                entry.tokens[item["position"]] = item["original_id"]
+            count = len(entry.relabels)
+            entry.relabels = []
+            return {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "restored": count,
+                "relabels": 0,
+            }
+        return None
+
     @_locked
     def summary(self, limit_bytes: int | None = None) -> dict[str, Any]:
         now = time.time()
@@ -573,6 +671,7 @@ class PromptCacheStore:
                 "age_seconds": round(now - entry.created, 2),
                 "last_used": entry.last_used,
                 "compat": list(entry.compat_key),
+                "relabels": len(entry.relabels),
             }
             for entry in self._entries
         ]

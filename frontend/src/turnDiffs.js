@@ -159,3 +159,26 @@ export function diffCaches(prevSnapshot, nextSnapshot, contextIds = []) {
     memoryChange: (nextSnapshot?.total_bytes ?? 0) - (prevSnapshot?.total_bytes ?? 0),
   }
 }
+
+// Consequences of staged edits: which cache entries are a full prefix of the
+// current request but stop being one for the edited request.  Each row
+// carries the entry and its divergence position against the edited context.
+export function stopsMatching(entries, beforeIds, afterIds) {
+  return entries
+    .filter((entry) => {
+      const ids = entry.token_ids || []
+      return (
+        commonPrefix(ids, beforeIds) >= ids.length &&
+        commonPrefix(ids, afterIds) < ids.length
+      )
+    })
+    .map((entry) => {
+      const ids = entry.token_ids || []
+      const divergence = commonPrefix(ids, afterIds)
+      return {
+        entry,
+        divergence,
+        extendsBeyond: divergence >= afterIds.length,
+      }
+    })
+}

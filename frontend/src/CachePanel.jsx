@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import { formatBytes } from './ConfigPanel.jsx'
 import TokenChips, { chipText } from './TokenChips.jsx'
 import { commonPrefix, diffCaches } from './turnDiffs.js'
-import { getCacheEntry } from './api.js'
+import { deleteCacheEntry, getCacheEntry, relabelEntry, restoreEntry } from './api.js'
 
 // The server-side prompt cache.  Three views: Overview (the summary as
-// before; clicking an entry opens it), Inside an entry (its tokens decoded,
-// the match against the viewed context, the per-layer state and a bytes
-// bar), and Changes (what this turn added, reused, evicted or made
-// unusable versus the previous turn).
+// before plus the quick switches; clicking an entry opens it), Inside an
+// entry (its tokens decoded, the match against the viewed context, the
+// per-layer state, a bytes bar, and the relabel/restore tools), and Changes
+// (what this turn added, reused, evicted or made unusable versus the
+// previous turn, plus the edits applied before it).
 
 function age(seconds) {
   if (seconds == null) return '—'
@@ -19,8 +20,13 @@ function age(seconds) {
 
 const KIND_LABEL = {
   checkpoint: 'checkpoint',
+  manual: 'saved by you',
   'after-generation': 'after reply',
 }
+
+const CUT_SHORTER_HELP =
+  'This model\'s cache cannot be trimmed: 24 of its 32 layers keep a running ' +
+  'state that cannot be rewound, so an entry cannot be cut shorter.'
 
 function CacheTabs({ view, onChange }) {
   return (
@@ -44,7 +50,84 @@ function CacheTabs({ view, onChange }) {
   )
 }
 
-function InsideView({ detail, contextIds, contextPieces, onBack }) {
+function CacheSwitches({ config, busy, historical, onConfigChange }) {
+  const reuse = config?.cache_reuse !== false
+  const checkpoints = config?.cache_checkpoints || 'last_message'
+  return (
+    <div className="cache-switches">
+      <label className="check" title="Whether requests look up and store prompt caches">
+        <input
+          type="checkbox"
+          checked={reuse}
+          disabled={busy || historical}
+          onChange={(event) => onConfigChange({ cache_reuse: event.target.checked })}
+        />
+        reuse cache
+      </label>
+      <label className="cache-switch-select" title="Where prefill stores prompt-cache snapshots">
+        <span className="muted small">checkpoints</span>
+        <select
+          value={checkpoints}
+          disabled={busy || historical}
+          onChange={(event) => onConfigChange({ cache_checkpoints: event.target.value })}
+        >
+          <option value="off">off</option>
+          <option value="last_message">last message</option>
+          <option value="every_message">every message</option>
+        </select>
+      </label>
+      {historical && <span className="muted small">read-only for a past turn</span>}
+    </div>
+  )
+}
+
+function RelabelForm({ position, text, setText, error, busy, onSubmit, onCancel }) {
+  return (
+    <div className="relabel-form">
+      <span className="muted small">relabel token {position}:</span>
+      <input
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        placeholder="exactly one token, e.g. ␣Bob → type “ Bob”"
+        autoFocus
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') onSubmit()
+          if (event.key === 'Escape') onCancel()
+        }}
+      />
+      <button type="button" className="mini primary" disabled={busy} onClick={onSubmit}>
+        relabel
+      </button>
+      <button type="button" className="mini" disabled={busy} onClick={onCancel}>
+        cancel
+      </button>
+      {error && <span className="note note-error">{error}</span>}
+      <span className="muted small">
+        The entry will claim the new token while the stored state stays as it
+        was. One token only; the count never changes.
+      </span>
+    </div>
+  )
+}
+
+function InsideView({
+  detail,
+  contextIds,
+  contextPieces,
+  relabelPosition,
+  relabelText,
+  setRelabelText,
+  relabelError,
+  relabelBusy,
+  onOpenRelabel,
+  onSubmitRelabel,
+  onCancelRelabel,
+  onRestore,
+  restoreBusy,
+  historical,
+  busy,
+  onBack,
+}) {
   const entryIds = detail.token_ids || []
   const common = commonPrefix(entryIds, contextIds)
   let matchNote
@@ -70,6 +153,11 @@ function InsideView({ detail, contextIds, contextPieces, onBack }) {
   const marks = []
   if (common > 0) marks.push({ start: 0, end: common, kind: 'cached' })
   if (!matchOk) marks.push({ start: common, end: Math.min(common + 1, entryIds.length), kind: 'divergence' })
+  const tampered = (detail.relabels || []).map((item) => ({
+    position: item.position,
+    original_id: item.original_id,
+    original_piece: item.original_piece,
+  }))
 
   return (
     <div className="cache-inside">
@@ -79,14 +167,71 @@ function InsideView({ detail, contextIds, contextPieces, onBack }) {
           {detail.after_message ? (
             <span className="muted"> · after message {detail.after_message}</span>
           ) : null}
+          {tampered.length > 0 && (
+            <span className="badge badge-off" title="tokens were relabelled; the stored state no longer matches the claimed tokens">
+              tampered
+            </span>
+          )}
         </span>
         <button type="button" className="mini" onClick={onBack}>← all entries</button>
       </div>
       <p className="muted small">{entryIds.length} tokens · {formatBytes(entryBytes)} accounted</p>
 
+      {tampered.length > 0 && !historical && (
+        <div className="row-between">
+          <span className="muted small">
+            {tampered.length} token{tampered.length > 1 ? 's' : ''} relabelled:
+            {tampered.map((item) => (
+              <span key={item.position} className="mono">
+                {' '}pos {item.position}: ⟨{chipText(detail.tokens[item.position])}⟩ was ⟨{JSON.stringify(item.original_piece)}⟩
+              </span>
+            ))}
+          </span>
+          <button
+            type="button"
+            className="mini"
+            disabled={busy || restoreBusy}
+            title="put the original token ids back and clear the relabels"
+            onClick={onRestore}
+          >
+            Restore
+          </button>
+        </div>
+      )}
+
       <p className={`note ${matchOk ? 'note-ok' : 'note-warn'}`}>{matchNote}</p>
 
-      <TokenChips tokens={detail.tokens} spans={detail.spans} marks={marks} />
+      {relabelPosition != null && (
+        <RelabelForm
+          position={relabelPosition}
+          text={relabelText}
+          setText={setRelabelText}
+          error={relabelError}
+          busy={relabelBusy}
+          onSubmit={onSubmitRelabel}
+          onCancel={onCancelRelabel}
+        />
+      )}
+
+      <TokenChips
+        tokens={detail.tokens}
+        spans={detail.spans}
+        marks={marks}
+        tampered={tampered}
+        onTokenClick={historical ? undefined : onOpenRelabel}
+      />
+
+      <div className="row-between">
+        <button
+          type="button"
+          className="mini"
+          disabled
+          title={CUT_SHORTER_HELP}
+        >
+          cut entry shorter
+        </button>
+        <span className="muted small">{CUT_SHORTER_HELP}</span>
+      </div>
 
       <div className="bytes-bar" title="Recurrent state · KV in use · KV allocated but empty">
         <span className="recurrent" style={{ width: pct(recurrent) }} />
@@ -139,78 +284,124 @@ function InsideView({ detail, contextIds, contextPieces, onBack }) {
   )
 }
 
-function ChangesView({ currentCache, previousCache, contextIds, lookup }) {
-  if (!previousCache) {
-    return <p className="muted">First turn — nothing to compare.</p>
-  }
-  const diff = diffCaches(previousCache, currentCache, contextIds)
-  const signed = (bytes) => `${bytes >= 0 ? '+' : ''}${formatBytes(bytes)}`
-  const entryLabel = (entry) =>
-    `#${entry.id} ${KIND_LABEL[entry.kind] || entry.kind}${entry.after_message ? ` after message ${entry.after_message}` : ''} · ${(entry.token_ids || []).length} tokens`
+function EditLog({ edits, historical }) {
+  const label = historical ? 'Before this turn you' : 'So far, before the next turn you'
   return (
-    <div className="change-list">
-      <div className="change-row">
-        <strong>Added</strong>
-        {diff.added.length === 0 ? (
-          <div className="muted">none</div>
-        ) : (
-          diff.added.map((entry) => (
-            <div key={entry.id}><span className="badge badge-ok">+ #{entry.id}</span> {entryLabel(entry)}</div>
-          ))
-        )}
-      </div>
-      <div className="change-row">
-        <strong>Evicted</strong>
-        {diff.evicted.length === 0 ? (
-          <div className="muted">none</div>
-        ) : (
-          diff.evicted.map((entry) => (
-            <div key={entry.id}><span className="badge badge-off">− #{entry.id}</span> {entryLabel(entry)}</div>
-          ))
-        )}
-      </div>
-      <div className="change-row">
-        <strong>Reused</strong>
-        {lookup?.reused_tokens ? (
-          <div>
-            <span className="badge">#{lookup.entry_id}</span>{' '}
-            {lookup.reused_tokens} tokens · {lookup.reason}
-          </div>
-        ) : (
-          <div className="muted">nothing was reused{lookup ? ` (${lookup.reason})` : ''}</div>
-        )}
-      </div>
-      <div className="change-row">
-        <strong>Unusable for this conversation</strong>
-        {diff.unusable.length === 0 ? (
-          <div className="muted">none — every entry is a full prefix of the request</div>
-        ) : (
-          diff.unusable.map(({ entry, divergence, extendsBeyond }) => (
-            <div key={entry.id}>
-              <span className="badge badge-warn">#{entry.id}</span> {entryLabel(entry)} ·{' '}
-              {extendsBeyond
-                ? `the request ends at token ${divergence}; this entry continues past it`
-                : `diverges at token ${divergence}`}
-            </div>
-          ))
-        )}
-      </div>
-      <div className="change-row">
-        <strong>Memory</strong>
-        <div>
-          {formatBytes(previousCache.total_bytes ?? 0)} → {formatBytes(currentCache.total_bytes ?? 0)} ·{' '}
-          {signed(diff.memoryChange)}
-        </div>
-      </div>
+    <div className="change-row edit-log">
+      <strong>{label}:</strong>
+      {edits && edits.length > 0 ? (
+        <ul>
+          {edits.map((line, index) => (
+            <li key={index}>{line}</li>
+          ))}
+        </ul>
+      ) : (
+        <div className="muted">nothing was edited</div>
+      )}
     </div>
   )
 }
 
-export default function CachePanel({ state, preview, generation, busy, onClearCache, viewTurn, prevTurn }) {
+function ChangesView({ currentCache, previousCache, contextIds, lookup, editLog, historical }) {
+  return (
+    <div className="change-list">
+      <EditLog edits={editLog} historical={historical} />
+      {!previousCache ? (
+        <p className="muted">First turn — nothing to compare.</p>
+      ) : (
+        <>
+          {(() => {
+            const diff = diffCaches(previousCache, currentCache, contextIds)
+            const signed = (bytes) => `${bytes >= 0 ? '+' : ''}${formatBytes(bytes)}`
+            const entryLabel = (entry) =>
+              `#${entry.id} ${KIND_LABEL[entry.kind] || entry.kind}${entry.after_message ? ` after message ${entry.after_message}` : ''} · ${(entry.token_ids || []).length} tokens`
+            return (
+              <>
+                <div className="change-row">
+                  <strong>Added</strong>
+                  {diff.added.length === 0 ? (
+                    <div className="muted">none</div>
+                  ) : (
+                    diff.added.map((entry) => (
+                      <div key={entry.id}><span className="badge badge-ok">+ #{entry.id}</span> {entryLabel(entry)}</div>
+                    ))
+                  )}
+                </div>
+                <div className="change-row">
+                  <strong>Evicted</strong>
+                  {diff.evicted.length === 0 ? (
+                    <div className="muted">none</div>
+                  ) : (
+                    diff.evicted.map((entry) => (
+                      <div key={entry.id}><span className="badge badge-off">− #{entry.id}</span> {entryLabel(entry)}</div>
+                    ))
+                  )}
+                </div>
+                <div className="change-row">
+                  <strong>Reused</strong>
+                  {lookup?.reused_tokens ? (
+                    <div>
+                      <span className="badge">#{lookup.entry_id}</span>{' '}
+                      {lookup.reused_tokens} tokens · {lookup.reason}
+                      {lookup.relabeled && <span className="badge badge-off"> tampered entry</span>}
+                    </div>
+                  ) : (
+                    <div className="muted">nothing was reused{lookup ? ` (${lookup.reason})` : ''}</div>
+                  )}
+                </div>
+                <div className="change-row">
+                  <strong>Unusable for this conversation</strong>
+                  {diff.unusable.length === 0 ? (
+                    <div className="muted">none — every entry is a full prefix of the request</div>
+                  ) : (
+                    diff.unusable.map(({ entry, divergence, extendsBeyond }) => (
+                      <div key={entry.id}>
+                        <span className="badge badge-warn">#{entry.id}</span> {entryLabel(entry)} ·{' '}
+                        {extendsBeyond
+                          ? `the request ends at token ${divergence}; this entry continues past it`
+                          : `diverges at token ${divergence}`}
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="change-row">
+                  <strong>Memory</strong>
+                  <div>
+                    {formatBytes(previousCache.total_bytes ?? 0)} → {formatBytes(currentCache.total_bytes ?? 0)} ·{' '}
+                    {signed(diff.memoryChange)}
+                  </div>
+                </div>
+              </>
+            )
+          })()}
+        </>
+      )}
+    </div>
+  )
+}
+
+export default function CachePanel({
+  state,
+  preview,
+  generation,
+  busy,
+  onClearCache,
+  viewTurn,
+  prevTurn,
+  pendingEdits,
+  onConfigChange,
+  onCacheAction,
+}) {
   const [view, setView] = useState('overview')
   const [insideId, setInsideId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailError, setDetailError] = useState(null)
+  const [detailVersion, setDetailVersion] = useState(0)
+  const [relabelPosition, setRelabelPosition] = useState(null)
+  const [relabelText, setRelabelText] = useState('')
+  const [relabelError, setRelabelError] = useState(null)
+  const [relabelBusy, setRelabelBusy] = useState(false)
+  const [restoreBusy, setRestoreBusy] = useState(false)
 
   const historical = Boolean(viewTurn)
   const liveEntries = state.cache?.entries || []
@@ -234,8 +425,9 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
     ? viewTurn.cache?.last_lookup
     : state.cache?.last_lookup
   const previousCache = prevTurn?.cache || null
+  const editLog = historical ? viewTurn.edits || [] : pendingEdits || []
 
-  // Inside view: fetch the entry details on demand.
+  // Inside view: fetch the entry details on demand (and after every edit).
   useEffect(() => {
     if (view !== 'inside' || insideId == null) {
       setDetail(null)
@@ -259,7 +451,72 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
     return () => {
       cancelled = true
     }
-  }, [view, insideId])
+  }, [view, insideId, detailVersion])
+
+  function openEntry(id) {
+    setInsideId(id)
+    setRelabelPosition(null)
+    setRelabelError(null)
+    setView('inside')
+  }
+
+  function handleDelete(entry) {
+    onCacheAction(
+      () => deleteCacheEntry(entry.id),
+      `deleted cache entry #${entry.id} (${KIND_LABEL[entry.kind] || entry.kind}${entry.after_message ? ` after message ${entry.after_message}` : ''}, ${entry.tokens} tokens)`,
+    ).catch(() => {})
+    if (insideId === entry.id) {
+      setInsideId(null)
+      setView('overview')
+    }
+  }
+
+  function handleOpenRelabel(position) {
+    const token = detail?.tokens?.[position]
+    setRelabelPosition(position)
+    setRelabelError(null)
+    setRelabelText(token?.text ?? token?.piece ?? '')
+  }
+
+  function handleSubmitRelabel() {
+    const position = relabelPosition
+    if (position == null || !detail) return
+    const token = detail.tokens[position]
+    const before = (token?.text ?? token?.piece ?? '').trim()
+    const after = relabelText.trim()
+    setRelabelBusy(true)
+    setRelabelError(null)
+    onCacheAction(
+      () => relabelEntry(insideId, position, relabelText),
+      `relabelled token ${position} of entry #${insideId}: '${before}' → '${after}'`,
+      { silent: true },
+    )
+      .then(() => {
+        setRelabelPosition(null)
+        setRelabelText('')
+        setDetailVersion((previous) => previous + 1)
+      })
+      .catch((error) => {
+        setRelabelError(error.detail || String(error))
+      })
+      .finally(() => setRelabelBusy(false))
+  }
+
+  function handleRestore() {
+    if (!detail) return
+    const count = (detail.relabels || []).length
+    setRestoreBusy(true)
+    onCacheAction(
+      () => restoreEntry(insideId),
+      `restored entry #${insideId}'s original tokens (${count} relabel${count === 1 ? '' : 's'} undone)`,
+    )
+      .then(() => {
+        setRelabelPosition(null)
+        setDetailVersion((previous) => previous + 1)
+      })
+      .catch(() => {})
+      .finally(() => setRestoreBusy(false))
+  }
 
   if (historical && !viewTurn.cache) {
     return <p className="muted">No cache snapshot was recorded for this turn.</p>
@@ -267,6 +524,12 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
 
   return (
     <div className="cache-panel">
+      <CacheSwitches
+        config={state.config}
+        busy={busy}
+        historical={historical}
+        onConfigChange={onConfigChange}
+      />
       <div className="ctx-headline">
         <span className="big-num">{entries.length}</span>
         <span className="muted">
@@ -297,6 +560,21 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
             detail={detail}
             contextIds={contextIds}
             contextPieces={contextPieces}
+            relabelPosition={relabelPosition}
+            relabelText={relabelText}
+            setRelabelText={setRelabelText}
+            relabelError={relabelError}
+            relabelBusy={relabelBusy}
+            onOpenRelabel={handleOpenRelabel}
+            onSubmitRelabel={handleSubmitRelabel}
+            onCancelRelabel={() => {
+              setRelabelPosition(null)
+              setRelabelError(null)
+            }}
+            onRestore={handleRestore}
+            restoreBusy={restoreBusy}
+            historical={historical}
+            busy={busy}
             onBack={() => setView('overview')}
           />
         )
@@ -308,6 +586,8 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
           previousCache={previousCache}
           contextIds={contextIds}
           lookup={lookupForChanges}
+          editLog={editLog}
+          historical={historical}
         />
       )}
 
@@ -318,7 +598,7 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
               <div className={`note ${lastLookup?.reused_tokens ? 'note-ok' : 'note-warn'}`}>
                 <strong>This request: </strong>
                 {lastLookup?.reused_tokens
-                  ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}`
+                  ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}${lastLookup.relabeled ? ' (a tampered entry)' : ''}`
                   : 'reused nothing'}
                 <div className="small">{lastLookup?.reason || 'no lookup recorded'}</div>
               </div>
@@ -329,7 +609,7 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
                   {!preview
                     ? 'type a message to see a prediction'
                     : prediction?.reused_tokens
-                      ? `reuses ${prediction.reused_tokens} of ${preview.budget?.input_tokens} tokens from #${prediction.entry_id}`
+                      ? `reuses ${prediction.reused_tokens} of ${preview.budget?.input_tokens} tokens from #${prediction.entry_id}${prediction.relabeled ? ' (a tampered entry)' : ''}`
                       : `nothing reusable (${prediction?.reason || 'no prediction'})`}
                   {preview && (
                     <div className="small">
@@ -342,7 +622,7 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
                   <div className={`note ${lastLookup.reused_tokens ? 'note-ok' : 'note-warn'}`}>
                     <strong>Last request: </strong>
                     {lastLookup.reused_tokens
-                      ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}`
+                      ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}${lastLookup.relabeled ? ' (a tampered entry)' : ''}`
                       : 'reused nothing'}
                     {lastPrefill ? `, read ${lastPrefill.processed_tokens} in ${lastPrefill.seconds}s` : ''}
                     <div className="small">{lastLookup.reason}</div>
@@ -355,40 +635,51 @@ export default function CachePanel({ state, preview, generation, busy, onClearCa
           {entries.length === 0 ? (
             <p className="muted">
               Empty. Each reply stores the conversation so far so a later request can
-              skip re-reading it.
+              skip re-reading it. Open Context › Edit to save a checkpoint without
+              generating anything.
             </p>
           ) : (
             <ul className="cache-entries">
               {[...entries].reverse().map((entry) => {
                 const next = !historical && prediction?.reused_tokens > 0 && prediction.entry_id === entry.id
                 const last = !historical && lastLookup?.reused_tokens > 0 && lastLookup.entry_id === entry.id
+                const tampered = (entry.relabels || 0) > 0
                 return (
                   <li key={entry.id} className={`cache-entry ${next ? 'is-next' : ''}`}>
-                    <button
-                      type="button"
-                      className="cache-entry-open"
-                      onClick={() => {
-                        setInsideId(entry.id)
-                        setView('inside')
-                      }}
-                    >
-                      <span className="row-between">
-                        <span>
-                          <strong>#{entry.id}</strong> {KIND_LABEL[entry.kind] || entry.kind}
-                          {entry.after_message ? <span className="muted"> · after message {entry.after_message}</span> : null}
+                    <div className="cache-entry-row">
+                      <button
+                        type="button"
+                        className="cache-entry-open"
+                        onClick={() => openEntry(entry.id)}
+                      >
+                        <span className="row-between">
+                          <span>
+                            <strong>#{entry.id}</strong> {KIND_LABEL[entry.kind] || entry.kind}
+                            {entry.after_message ? <span className="muted"> · after message {entry.after_message}</span> : null}
+                          </span>
+                          <span className="ctx-tags">
+                            {tampered && <span className="badge badge-off">tampered</span>}
+                            {next && <span className="badge badge-ok">next request uses this</span>}
+                            {last && <span className="badge">used last</span>}
+                          </span>
                         </span>
-                        <span className="ctx-tags">
-                          {next && <span className="badge badge-ok">next request uses this</span>}
-                          {last && <span className="badge">used last</span>}
+                        <span className="entry-bar">
+                          <span style={{ width: `${((entry.tokens || 0) / longest) * 100}%` }} />
                         </span>
-                      </span>
-                      <span className="entry-bar">
-                        <span style={{ width: `${((entry.tokens || 0) / longest) * 100}%` }} />
-                      </span>
-                      <span className="muted small">
-                        {entry.tokens ?? '?'} tokens · {formatBytes(entry.nbytes)} · {age(entry.age_seconds)}
-                      </span>
-                    </button>
+                        <span className="muted small">
+                          {entry.tokens ?? '?'} tokens · {formatBytes(entry.nbytes)} · {age(entry.age_seconds)}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="mini danger cache-entry-delete"
+                        disabled={busy || historical}
+                        title={historical ? 'snapshots of past turns are read-only' : 'delete this entry'}
+                        onClick={() => handleDelete(entry)}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </li>
                 )
               })}

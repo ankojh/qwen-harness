@@ -16,6 +16,7 @@ never start work: it is a GET.
 from __future__ import annotations
 
 import asyncio
+import copy
 import threading
 import time
 import uuid
@@ -24,15 +25,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from mlx_lm.models.cache import make_prompt_cache
 from pydantic import BaseModel, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from config import AppConfig, PRESETS, defaults_dict, fields_schema
+from config import RESERVED_TEMPLATE_KWARGS, AppConfig, PRESETS, defaults_dict, fields_schema
 from events import EventLog, format_sse
-from generation import GenerationStore, run_generation
+from generation import GenerationStore, prefill_to, run_generation
 from model import (
     LoadedModel,
     apply_mlx_cache_limit,
@@ -42,7 +45,15 @@ from model import (
     read_mlx_cache_limit,
     unload_model,
 )
-from prompt import Session, _token_is_special, _token_spans, _token_text, build_prompt
+from prompt import (
+    Session,
+    _token_is_special,
+    _token_spans,
+    _token_text,
+    build_prompt,
+    checkpoint_boundary,
+    relabel_token_ids,
+)
 from prompt_cache import PromptCacheStore, describe_cache_layers
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
@@ -186,6 +197,16 @@ class PreviewRequest(BaseModel):
 class GenerateRequest(BaseModel):
     client_request_id: str
     session: Session
+
+
+class CheckpointRequest(BaseModel):
+    session: Session
+    after_message: int
+
+
+class RelabelRequest(BaseModel):
+    position: int
+    text: str
 
 
 @asynccontextmanager
@@ -478,6 +499,18 @@ def _read_cache_entry(entry: Any, tokenizer: Any, layer_types: list[str] | None)
         kv_per_token_per_layer = round(
             kv_allocated / allocated_tokens / len(kv_layers), 2
         )
+    relabels = []
+    for item in entry.relabels:
+        relabels.append(
+            {
+                "position": item["position"],
+                "original_id": item["original_id"],
+                "original_piece": tokenizer.convert_ids_to_tokens(
+                    item["original_id"]
+                ),
+                "new_id": item["new_id"],
+            }
+        )
     return {
         "id": entry.id,
         "kind": entry.kind,
@@ -486,6 +519,7 @@ def _read_cache_entry(entry: Any, tokenizer: Any, layer_types: list[str] | None)
         "tokens": tokens,
         "text": tokenizer.decode(token_ids),
         "spans": _token_spans(token_ids, tokenizer, None),
+        "relabels": relabels,
         "layers": layers,
         "totals": {
             "recurrent_bytes": sum(
@@ -520,6 +554,262 @@ async def cache_entry(entry_id: int, request: Request):
     layer_types = (ctx.loaded.info or {}).get("layer_types") or None
     return await asyncio.get_running_loop().run_in_executor(
         ctx.executor, _read_cache_entry, entry, ctx.loaded.tokenizer, layer_types
+    )
+
+
+# ---------------------------------------------------------------- cache edit
+@api.delete("/cache/entries/{entry_id}")
+async def delete_cache_entry(entry_id: int, request: Request):
+    ctx = _ctx(request)
+    if ctx.active_generation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a generation is running; wait for it to finish before editing the cache",
+        )
+    info = ctx.cache.remove(entry_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"unknown cache entry {entry_id}")
+    return info
+
+
+@api.post("/cache/entries/{entry_id}/relabel")
+async def relabel_entry(entry_id: int, payload: RelabelRequest, request: Request):
+    ctx = _ctx(request)
+    if ctx.active_generation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a generation is running; wait for it to finish before editing the cache",
+        )
+    if ctx.loaded is None:
+        raise HTTPException(status_code=409, detail="load the model first")
+    entry = ctx.cache.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"unknown cache entry {entry_id}")
+    if payload.position < 0 or payload.position >= len(entry.tokens):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"position {payload.position} is outside the entry "
+                f"({len(entry.tokens)} tokens)"
+            ),
+        )
+    ids = relabel_token_ids(ctx.loaded.tokenizer, payload.text)
+    if len(ids) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{payload.text!r} is {len(ids)} tokens; relabel replaces "
+                "exactly one token"
+            ),
+        )
+    info = ctx.cache.relabel(entry_id, payload.position, ids[0])
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"unknown cache entry {entry_id}")
+    return info
+
+
+@api.post("/cache/entries/{entry_id}/restore")
+async def restore_entry(entry_id: int, request: Request):
+    ctx = _ctx(request)
+    if ctx.active_generation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a generation is running; wait for it to finish before editing the cache",
+        )
+    info = ctx.cache.restore(entry_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"unknown cache entry {entry_id}")
+    return info
+
+
+def _save_checkpoint(ctx: AppState, payload: CheckpointRequest) -> dict[str, Any]:
+    """Snapshot the cache at the end of message ``after_message``.
+
+    Runs on the MLX worker thread: builds the prompt, takes the boundary the
+    automatic checkpoint logic uses (``checkpoint_boundary``), reuses whatever
+    prefix the cache offers, prefills up to that boundary with the shared
+    chunked prefill, and inserts an entry of kind ``manual``.
+    """
+    loaded = ctx.loaded
+    tokenizer = loaded.tokenizer
+    caps = capabilities(ctx.config, loaded.info)
+    compat_key = _compat_key(ctx)
+    report = build_prompt(
+        payload.session,
+        ctx.config,
+        tokenizer,
+        loaded.info,
+        caps,
+        cache_store=ctx.cache,
+        compat_key=compat_key,
+        include_pieces=False,
+    )
+    if not report["ok"]:
+        raise HTTPException(
+            status_code=400, detail=f"the prompt is not valid: {report['error']}"
+        )
+    tokens = report["token_ids"]
+    if not tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="the prompt is empty; there is nothing to checkpoint",
+        )
+
+    # The boundary: the same computation build_prompt uses for its checkpoint
+    # table, applied to the requested message.
+    thinking_supported = bool(
+        caps.get("enable_thinking", {}).get("supported", True)
+    )
+    template_kwargs = {
+        key: value
+        for key, value in ctx.config.template_kwargs.items()
+        if key not in RESERVED_TEMPLATE_KWARGS
+    }
+    template_messages = []
+    for item in report["submitted_messages"]:
+        message: dict[str, Any] = {"role": item["role"], "content": item["content"]}
+        if item["reasoning_content"]:
+            message["reasoning_content"] = item["reasoning_content"]
+        template_messages.append(message)
+    if not 1 <= payload.after_message <= len(template_messages):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"after_message {payload.after_message} is out of range: the "
+                f"request has {len(template_messages)} enabled message(s)"
+            ),
+        )
+    boundary = checkpoint_boundary(
+        template_messages=template_messages,
+        token_ids=tokens,
+        config=ctx.config,
+        tokenizer=tokenizer,
+        thinking_supported=thinking_supported,
+        template_kwargs=template_kwargs,
+        after_message=payload.after_message,
+    )
+    if not boundary["ok"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"no boundary after message {payload.after_message}: "
+                f"{boundary['reason']}"
+            ),
+        )
+    position = boundary["position"]
+
+    # Reuse whatever prefix the cache offers, then prefill up to the boundary.
+    cache = None
+    reused = 0
+    if ctx.config.cache_reuse:
+        cache, reused, lookup = ctx.cache.lookup(tokens, compat_key)
+    else:
+        lookup = {
+            "entry_id": None,
+            "kind": None,
+            "entry_tokens": 0,
+            "reused_tokens": 0,
+            "relabeled": False,
+            "reason": "cache_reuse is off",
+        }
+        ctx.cache.note_lookup(lookup)
+    ctx.events.emit(
+        "cache.lookup",
+        {"generation_id": None, "prompt_tokens": len(tokens), **lookup},
+    )
+
+    if cache is None:
+        cache = make_prompt_cache(
+            loaded.model,
+            max_kv_size=(
+                ctx.config.max_kv_size
+                if not loaded.info.get("has_make_cache")
+                else None
+            ),
+        )
+        reused = 0
+
+    prefill = prefill_to(
+        model=loaded.model,
+        tokens=tokens,
+        cache=cache,
+        start=reused,
+        end=position,
+        config=ctx.config,
+        emit=ctx.events.emit,
+        cancel=threading.Event(),
+        counters=ctx.counters,
+        stream=mx.default_stream(mx.default_device()),
+        gen_id=None,
+    )
+
+    # Snapshot and store (or mark used when an identical entry exists).
+    key = tokens[:position]
+    existing = ctx.cache.touch_exact(key, compat_key)
+    used_existing = existing is not None
+    if existing is not None:
+        info = existing
+        ctx.events.emit(
+            "cache.checkpoint",
+            {
+                "generation_id": None,
+                "after_message": payload.after_message,
+                "position": position,
+                "used_existing": True,
+                "detail": (
+                    "an identical entry is already stored; marked used "
+                    "instead of copying the cache again"
+                ),
+                **existing,
+            },
+        )
+    else:
+        snapshot = copy.deepcopy(cache)
+        info = ctx.cache.insert(
+            key,
+            snapshot,
+            "manual",
+            compat_key,
+            max_entries=ctx.config.cache_max_entries,
+            max_bytes=int(ctx.config.cache_max_gb * 1_000_000_000),
+            after_message=payload.after_message,
+        )
+        ctx.events.emit(
+            "cache.checkpoint",
+            {
+                "generation_id": None,
+                "after_message": payload.after_message,
+                "position": position,
+                "used_existing": False,
+                **info,
+            },
+        )
+    return {
+        "after_message": payload.after_message,
+        "position": position,
+        "kind": "manual",
+        "used_existing": used_existing,
+        "prefill": {"reused_tokens": reused, **prefill},
+        **info,
+    }
+
+
+@api.post("/cache/checkpoint")
+async def save_checkpoint(payload: CheckpointRequest, request: Request):
+    ctx = _ctx(request)
+    if ctx.active_generation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a generation is running; wait for it to finish before saving a checkpoint",
+        )
+    if ctx.loaded is None:
+        raise HTTPException(status_code=409, detail="load the model first")
+    if payload.after_message < 1:
+        raise HTTPException(
+            status_code=400, detail="after_message is 1-based and must be >= 1"
+        )
+    return await asyncio.get_running_loop().run_in_executor(
+        ctx.executor, _save_checkpoint, ctx, payload
     )
 
 
