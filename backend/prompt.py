@@ -92,6 +92,113 @@ def _tokenize(tokenizer: Any, text: str) -> list[int]:
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
+def _token_text(tokenizer: Any, token_id: int, piece: str) -> str:
+    """The token's own decoded text (best effort; falls back to the piece)."""
+    try:
+        return tokenizer.decode([token_id])
+    except Exception:  # noqa: BLE001 - a display fallback, never fatal
+        return piece or ""
+
+
+def _token_is_special(tokenizer: Any, token_id: int) -> bool:
+    """True for special or added tokens (``<|im_start|>``, ``<think>``, ...)."""
+    try:
+        if tokenizer.is_special_token(token_id):
+            return True
+    except Exception:  # noqa: BLE001 - tokenizer variants differ
+        pass
+    decoder = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    return token_id in decoder
+
+
+def _token_spans(
+    token_ids: list[int],
+    tokenizer: Any,
+    submitted: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Split a token list at each ``<|im_start|>`` into per-message spans.
+
+    With ``submitted`` the spans are matched to messages in order and the
+    trailing assistant opener (when present) is the last span; any mismatch
+    (raw mode, an unusual template) returns None.  Without ``submitted``
+    (cache entries) roles are derived from the role token after the opener
+    and a trailing assistant segment without ``<|im_end|>`` is the opener.
+    Positions are half-open.
+    """
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    if not isinstance(im_start, int) or im_start < 0:
+        return None
+    starts = [i for i, token_id in enumerate(token_ids) if token_id == im_start]
+    if not starts:
+        return None
+
+    def segment_role(start: int, end: int) -> str | None:
+        if end - start < 2:
+            return None
+        return (tokenizer.convert_ids_to_tokens(token_ids[start + 1]) or "").strip()
+
+    def has_end(start: int, end: int) -> bool:
+        if end <= start:
+            return False
+        return (tokenizer.convert_ids_to_tokens(token_ids[end - 1]) or "").strip() == "<|im_end|>"
+
+    spans: list[dict[str, Any]] = []
+    total = len(starts)
+    for k, start in enumerate(starts):
+        end = starts[k + 1] if k + 1 < total else len(token_ids)
+        role = segment_role(start, end)
+        if submitted is not None:
+            if k < len(submitted):
+                message = submitted[k]
+                if role is not None and role != message["role"]:
+                    return None
+                spans.append(
+                    {
+                        "index": message["index"],
+                        "role": message["role"],
+                        "source": message["source"],
+                        "start": start,
+                        "end": end,
+                        "kind": "message",
+                    }
+                )
+            else:
+                # A trailing span beyond the submitted messages must be the
+                # assistant opener the template appends.
+                if k != len(submitted) or role != "assistant":
+                    return None
+                spans.append(
+                    {
+                        "index": None,
+                        "role": "assistant",
+                        "source": "template",
+                        "start": start,
+                        "end": end,
+                        "kind": "opener",
+                    }
+                )
+        else:
+            kind = "message"
+            if k == total - 1 and role == "assistant" and not has_end(start, end):
+                kind = "opener"
+            spans.append(
+                {
+                    "index": k + 1,
+                    "role": role or "unknown",
+                    "source": "cache",
+                    "start": start,
+                    "end": end,
+                    "kind": kind,
+                }
+            )
+    if submitted is not None and not (
+        len(spans) == len(submitted)
+        or (len(spans) == len(submitted) + 1 and spans[-1]["kind"] == "opener")
+    ):
+        return None
+    return spans
+
+
 def _hash_tokens(token_ids: list[int]) -> str:
     payload = ",".join(str(token_id) for token_id in token_ids)
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -297,6 +404,7 @@ def build_prompt(
                 "text": "",
                 "token_ids": [],
                 "token_pieces": [] if include_pieces else None,
+                "spans": None,
                 "submitted_messages": submitted,
                 "dropped_messages": [],
                 "transformations": transformations,
@@ -513,11 +621,21 @@ def build_prompt(
         starts_in_thinking = text.rfind(think_start) > text.rfind(think_end)
 
     pieces = None
+    spans = None
     if include_pieces:
-        pieces = [
-            {"id": token_id, "piece": tokenizer.convert_ids_to_tokens(token_id)}
-            for token_id in token_ids
-        ]
+        pieces = []
+        for token_id in token_ids:
+            piece = tokenizer.convert_ids_to_tokens(token_id)
+            pieces.append(
+                {
+                    "id": token_id,
+                    "piece": piece,
+                    "text": _token_text(tokenizer, token_id, piece),
+                    "special": _token_is_special(tokenizer, token_id),
+                }
+            )
+        if session.mode == "messages":
+            spans = _token_spans(token_ids, tokenizer, submitted)
 
     cache_prediction = None
     checkpoint_estimate = None
@@ -552,6 +670,7 @@ def build_prompt(
         "text": text,
         "token_ids": token_ids,
         "token_pieces": pieces,
+        "spans": spans,
         "submitted_messages": submitted,
         "dropped_messages": dropped,
         "transformations": transformations,

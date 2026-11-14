@@ -241,6 +241,7 @@ def run_generation(
             caps,
             cache_store=cache_store,
             compat_key=compat_key,
+            include_pieces=True,
         )
         prompt_seconds = time.perf_counter() - prompt_started
 

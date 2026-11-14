@@ -149,6 +149,7 @@ def load_model(config: AppConfig) -> LoadedModel:
         "model_type": raw_config.get("model_type"),
         "num_layers": text_config.get("num_hidden_layers"),
         "layer_mix": layer_mix,
+        "layer_types": layer_types,
         "hidden_size": text_config.get("hidden_size"),
         "vocab_size": text_config.get("vocab_size") or len(tokenizer),
         "max_position_embeddings": text_config.get("max_position_embeddings"),

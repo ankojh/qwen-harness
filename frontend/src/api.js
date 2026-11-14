@@ -60,6 +60,8 @@ export const stopGeneration = () =>
   request('/api/generate/stop', { method: 'POST' })
 export const getGeneration = (id) => request(`/api/generations/${id}`)
 export const clearCache = () => request('/api/cache/clear', { method: 'POST' })
+export const getCacheTokens = () => request('/api/cache/tokens')
+export const getCacheEntry = (id) => request(`/api/cache/entries/${id}`)
 
 // Every named event the backend emits.  EventSource only fires onmessage for
 // unnamed events, so each type is registered explicitly.

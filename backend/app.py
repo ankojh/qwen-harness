@@ -42,8 +42,8 @@ from model import (
     read_mlx_cache_limit,
     unload_model,
 )
-from prompt import Session, build_prompt
-from prompt_cache import PromptCacheStore
+from prompt import Session, _token_is_special, _token_spans, _token_text, build_prompt
+from prompt_cache import PromptCacheStore, describe_cache_layers
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
@@ -441,6 +441,86 @@ async def clear_cache(request: Request):
     ctx = _ctx(request)
     ctx.cache.clear("manual clear")
     return _public_state(ctx)
+
+
+def _read_cache_entry(entry: Any, tokenizer: Any, layer_types: list[str] | None) -> dict[str, Any]:
+    """Read-only inspection of one stored cache entry.
+
+    Runs on the MLX worker thread: it reads tokenizer state and MLX array
+    *metadata* (shapes, dtypes, sizes) only, never the values inside, and
+    never copies the cache.
+    """
+    token_ids = list(entry.tokens)
+    tokens = []
+    for token_id in token_ids:
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+        tokens.append(
+            {
+                "id": token_id,
+                "piece": piece,
+                "text": _token_text(tokenizer, token_id, piece),
+                "special": _token_is_special(tokenizer, token_id),
+            }
+        )
+    layers = describe_cache_layers(entry.cache, layer_types)
+    kv_layers = [layer for layer in layers if layer["kind"] == "full_attention"]
+    recurrent_layers = [
+        layer for layer in layers if layer["kind"] == "linear_attention"
+    ]
+    kv_allocated = sum(layer["allocated_bytes"] for layer in kv_layers)
+    kv_used = sum(layer["used_bytes"] for layer in kv_layers)
+    allocated_tokens = next(
+        (layer["allocated_tokens"] for layer in kv_layers if layer["allocated_tokens"]),
+        None,
+    )
+    kv_per_token_per_layer = None
+    if kv_layers and allocated_tokens:
+        kv_per_token_per_layer = round(
+            kv_allocated / allocated_tokens / len(kv_layers), 2
+        )
+    return {
+        "id": entry.id,
+        "kind": entry.kind,
+        "after_message": entry.after_message,
+        "token_ids": token_ids,
+        "tokens": tokens,
+        "text": tokenizer.decode(token_ids),
+        "spans": _token_spans(token_ids, tokenizer, None),
+        "layers": layers,
+        "totals": {
+            "recurrent_bytes": sum(
+                layer["allocated_bytes"] for layer in recurrent_layers
+            ),
+            "kv_used_bytes": kv_used,
+            "kv_allocated_bytes": kv_allocated,
+            "kv_bytes_per_token_per_layer": kv_per_token_per_layer,
+        },
+    }
+
+
+@api.get("/cache/tokens")
+async def cache_tokens(request: Request):
+    """Token ids per entry; plain ints under the store lock, safe on the loop."""
+    return {"entries": _ctx(request).cache.token_lists()}
+
+
+@api.get("/cache/entries/{entry_id}")
+async def cache_entry(entry_id: int, request: Request):
+    ctx = _ctx(request)
+    if ctx.active_generation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a generation is running; inspect cache entries when it finishes",
+        )
+    if ctx.loaded is None:
+        raise HTTPException(status_code=409, detail="load the model first")
+    entry = ctx.cache.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"unknown cache entry {entry_id}")
+    layer_types = (ctx.loaded.info or {}).get("layer_types") or None
+    return await asyncio.get_running_loop().run_in_executor(
+        ctx.executor, _read_cache_entry, entry, ctx.loaded.tokenizer, layer_types
+    )
 
 
 # ----------------------------------------------------------------------- SSE

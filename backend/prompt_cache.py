@@ -97,6 +97,100 @@ def cache_types(cache: list[Any]) -> dict[str, int]:
     return counts
 
 
+def _array_metas(name: str, arr: Any) -> list[dict[str, Any]]:
+    """Shape/dtype/size metadata for one array or a quantized list of arrays."""
+    if arr is None:
+        return []
+    if isinstance(arr, (list, tuple)):
+        return [
+            {
+                "name": f"{name}[{position}]",
+                "shape": list(item.shape),
+                "dtype": str(item.dtype),
+                "nbytes": int(item.nbytes),
+            }
+            for position, item in enumerate(arr)
+        ]
+    return [
+        {
+            "name": name,
+            "shape": list(arr.shape),
+            "dtype": str(arr.dtype),
+            "nbytes": int(arr.nbytes),
+        }
+    ]
+
+
+def _allocated_tokens(keys: Any) -> int | None:
+    """Token capacity of a KV layer (axis 2 of the keys buffer)."""
+    if isinstance(keys, (list, tuple)):
+        return int(keys[0].shape[2]) if keys else None
+    if keys is not None and hasattr(keys, "shape") and len(keys.shape) > 2:
+        return int(keys.shape[2])
+    return None
+
+
+def describe_cache_layers(
+    cache: list[Any], layer_types: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Per-layer metadata for one stored cache snapshot.
+
+    Read-only inspection of mlx-lm cache objects: shapes, dtypes and byte
+    sizes only, never the values inside.  Must run on the MLX worker thread
+    (``ctx.executor``), because it touches MLX array objects.  For KVCache
+    layers ``used_tokens`` is the offset and ``allocated_tokens`` the buffer
+    capacity (a multiple of ``KVCache.step``); ArraysCache layers have no
+    per-token split and report null token fields.
+    """
+    rows: list[dict[str, Any]] = []
+    for index, layer in enumerate(cache):
+        cls = type(layer).__name__
+        kind = "linear_attention" if cls.endswith("ArraysCache") else "full_attention"
+        if layer_types and index < len(layer_types):
+            # The model config says which layer index is which; prefer it.
+            kind = (
+                "linear_attention"
+                if layer_types[index] == "linear_attention"
+                else "full_attention"
+            )
+        arrays: list[dict[str, Any]] = []
+        keys = getattr(layer, "keys", None)
+        if keys is not None:
+            arrays.extend(_array_metas("keys", keys))
+            arrays.extend(_array_metas("values", getattr(layer, "values", None)))
+            allocated_tokens = _allocated_tokens(keys)
+            used_tokens = int(getattr(layer, "offset", 0) or 0)
+            allocated_bytes = int(layer.nbytes)
+            used_bytes = (
+                round(allocated_bytes * used_tokens / allocated_tokens)
+                if allocated_tokens
+                else 0
+            )
+        else:
+            state = getattr(layer, "cache", None)
+            if isinstance(state, (list, tuple)):
+                for position, arr in enumerate(state):
+                    if arr is not None:
+                        arrays.extend(_array_metas(f"state[{position}]", arr))
+            used_tokens = None
+            allocated_tokens = None
+            allocated_bytes = int(layer.nbytes)
+            used_bytes = allocated_bytes
+        rows.append(
+            {
+                "index": index,
+                "class": cls,
+                "kind": kind,
+                "arrays": arrays,
+                "used_tokens": used_tokens,
+                "allocated_tokens": allocated_tokens,
+                "used_bytes": used_bytes,
+                "allocated_bytes": allocated_bytes,
+            }
+        )
+    return rows
+
+
 class PromptCacheStore:
     def __init__(self, emit: Emit | None = None):
         self._entries: list[CacheEntry] = []
@@ -444,6 +538,26 @@ class PromptCacheStore:
         return count
 
     # -------------------------------------------------------------- summary
+    @_locked
+    def token_lists(self) -> list[dict[str, Any]]:
+        """Exact token ids per entry.  Plain Python ints, no MLX objects."""
+        return [
+            {
+                "id": entry.id,
+                "kind": entry.kind,
+                "after_message": entry.after_message,
+                "token_ids": list(entry.tokens),
+            }
+            for entry in self._entries
+        ]
+
+    @_locked
+    def get_entry(self, entry_id: int) -> CacheEntry | None:
+        for entry in self._entries:
+            if entry.id == entry_id:
+                return entry
+        return None
+
     @_locked
     def summary(self, limit_bytes: int | None = None) -> dict[str, Any]:
         now = time.time()

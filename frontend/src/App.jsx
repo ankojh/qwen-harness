@@ -11,6 +11,7 @@ import CachePanel from './CachePanel.jsx'
 import {
   clearCache,
   formatError,
+  getCacheTokens,
   getGeneration,
   getState,
   modelAction,
@@ -43,6 +44,33 @@ function newRequestId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+// Turns 1..N (their recorded snapshots) plus Next (the request being typed).
+function TurnSelector({ turns, viewTurnId, onSelect }) {
+  if (turns.length === 0) return null
+  return (
+    <div className="turn-selector">
+      <span className="muted">Viewing</span>
+      {turns.map((turn) => (
+        <button
+          key={turn.id}
+          type="button"
+          className={viewTurnId === turn.id ? 'active' : ''}
+          onClick={() => onSelect(viewTurnId === turn.id ? null : turn.id)}
+        >
+          Turn {turn.n}
+        </button>
+      ))}
+      <button
+        type="button"
+        className={viewTurnId === null ? 'active' : ''}
+        onClick={() => onSelect(null)}
+      >
+        Next
+      </button>
+    </div>
+  )
+}
+
 export default function App() {
   const [state, setState] = useState(null)
   const [session, setSession] = useState({
@@ -54,6 +82,7 @@ export default function App() {
   const [lastInput, setLastInput] = useState('')
   const [turns, setTurns] = useState([])
   const [detailsTab, setDetailsTab] = useState(null)
+  const [viewTurnId, setViewTurnId] = useState(null)
   const [preview, setPreview] = useState(null)
   const [previewError, setPreviewError] = useState(null)
   const [autoPreview, setAutoPreview] = useState(true)
@@ -237,7 +266,8 @@ export default function App() {
 
   // When a run started by Send finishes, its answer joins the conversation
   // (without the thinking, which the chat template would drop anyway) and the
-  // turn is recorded for the context growth chart.
+  // turn is recorded with its context report and a cache snapshot: the entry
+  // token lists plus the summary rows, fetched right after generation.finished.
   useEffect(() => {
     if (!generation || !generation.finish || generation.id !== pendingTurnRef.current) return
     pendingTurnRef.current = null
@@ -259,8 +289,27 @@ export default function App() {
         reused: generation.stats?.prefill?.reused_tokens ?? 0,
         generated,
         thinking: (generation.tokens || []).filter((token) => token.channel === 'thinking').length,
+        context: generation.prompt,
+        cache: null,
       },
     ])
+    ;(async () => {
+      try {
+        const [tokenLists, freshState] = await Promise.all([getCacheTokens(), getState()])
+        const rows = new Map((freshState.cache?.entries || []).map((entry) => [entry.id, entry]))
+        const entries = (tokenLists.entries || []).map((row) => ({ ...rows.get(row.id), ...row }))
+        const snapshot = {
+          entries,
+          total_bytes: freshState.cache?.total_bytes ?? 0,
+          last_lookup: freshState.cache?.last_lookup ?? null,
+        }
+        setTurns((previous) =>
+          previous.map((turn) => (turn.id === generation.id ? { ...turn, cache: snapshot } : turn)),
+        )
+      } catch {
+        // The snapshot is best-effort; the live panels keep working without it.
+      }
+    })()
   }, [generation])
 
   useEffect(() => {
@@ -366,6 +415,7 @@ export default function App() {
     pendingTurnRef.current = null
     setSession((previous) => ({ ...previous, mode: 'messages', messages: [], raw_text: '' }))
     setTurns([])
+    setViewTurnId(null)
     setDraft('')
     setLastInput('')
     setGeneration(null)
@@ -421,6 +471,10 @@ export default function App() {
   const running = Boolean(activeGenId)
   const busy = saving || running
   const modelLoaded = Boolean(state.model_loaded)
+  // Which snapshot the right column shows: a historical turn, or Next (null).
+  const viewTurn = viewTurnId ? turns.find((turn) => turn.id === viewTurnId) || null : null
+  const viewIndex = viewTurn ? turns.findIndex((turn) => turn.id === viewTurn.id) : -1
+  const prevTurn = viewTurn ? turns[viewIndex - 1] || null : turns[turns.length - 1] || null
 
   return (
     <div className="app">
@@ -487,34 +541,41 @@ export default function App() {
           <PanelResizeHandle className="resize vertical" />
 
           <Panel defaultSize={50} minSize={25}>
-            <PanelGroup direction="vertical" style={{ height: '100%' }}>
-              <Panel defaultSize={55} minSize={15}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Context <span className="title-note">lives in this browser tab, sent in full every request</span></div>
-                  <ContextPanel
-                    preview={preview}
-                    previewError={previewError}
-                    session={session}
-                    draft={draft}
-                    turns={turns}
-                    modelLoaded={modelLoaded}
-                  />
-                </div>
-              </Panel>
-              <PanelResizeHandle className="resize horizontal" />
-              <Panel defaultSize={45} minSize={15}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Cache <span className="title-note">lives on the server, reused on an exact prefix match</span></div>
-                  <CachePanel
-                    state={state}
-                    preview={preview}
-                    generation={generation}
-                    busy={busy}
-                    onClearCache={handleClearCache}
-                  />
-                </div>
-              </Panel>
-            </PanelGroup>
+            <div className="right-column">
+              <TurnSelector turns={turns} viewTurnId={viewTurnId} onSelect={setViewTurnId} />
+              <PanelGroup direction="vertical" style={{ flex: 1, minHeight: 0 }}>
+                <Panel defaultSize={55} minSize={15}>
+                  <div className="panel-scroll">
+                    <div className="panel-title">Context <span className="title-note">lives in this browser tab, sent in full every request</span></div>
+                    <ContextPanel
+                      preview={preview}
+                      previewError={previewError}
+                      session={session}
+                      draft={draft}
+                      turns={turns}
+                      modelLoaded={modelLoaded}
+                      viewTurn={viewTurn}
+                      prevTurn={prevTurn}
+                    />
+                  </div>
+                </Panel>
+                <PanelResizeHandle className="resize horizontal" />
+                <Panel defaultSize={45} minSize={15}>
+                  <div className="panel-scroll">
+                    <div className="panel-title">Cache <span className="title-note">lives on the server, reused on an exact prefix match</span></div>
+                    <CachePanel
+                      state={state}
+                      preview={preview}
+                      generation={generation}
+                      busy={busy}
+                      onClearCache={handleClearCache}
+                      viewTurn={viewTurn}
+                      prevTurn={prevTurn}
+                    />
+                  </div>
+                </Panel>
+              </PanelGroup>
+            </div>
           </Panel>
         </PanelGroup>
       </div>
