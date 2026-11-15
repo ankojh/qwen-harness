@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Pipeline from './Pipeline.jsx'
 import Caption from './Caption.jsx'
 import TapeMap from './TapeMap.jsx'
@@ -109,6 +109,8 @@ export default function Stage({
   const [stagedPreview, setStagedPreview] = useState(null)
   const [stagedPreviewError, setStagedPreviewError] = useState(null)
   const [pulseEntryId, setPulseEntryId] = useState(null)
+  const [fadeTail, setFadeTail] = useState([])
+  const wasRunningRef = useRef(false)
 
   const historical = Boolean(viewTurn)
   const config = state?.config || {}
@@ -132,6 +134,20 @@ export default function Stage({
     }
     return undefined
   }, [runProgress?.lookup])
+
+  // The moment the run finishes, the generated tail (thinking especially)
+  // fades out of the tape while the map switches to the next-request
+  // preview; the answer joins the tape and the after-reply bar turns red
+  // where the thinking was.
+  useEffect(() => {
+    if (wasRunningRef.current && !running && tokens.length > 0) {
+      setFadeTail(tokens)
+      const timer = setTimeout(() => setFadeTail([]), 1100)
+      return () => clearTimeout(timer)
+    }
+    wasRunningRef.current = running
+    return undefined
+  }, [running, tokens])
 
   // Tell App whether a staged edit is open (blocks Send).
   useEffect(() => {
@@ -519,6 +535,16 @@ export default function Stage({
       )}
       {previewErrorNote && <p className="note note-error">{previewErrorNote}</p>}
 
+      <p className="pipe-mode" role="status">
+        {historical
+          ? `turn ${viewTurn.n} · what was recorded for this request`
+          : running
+            ? 'this request · live'
+            : justFinished
+              ? 'this request just finished · switching to the next-request preview…'
+              : 'next request · a prediction while you type'}
+      </p>
+
       <Pipeline
         model={whatIfModel}
         lookupKnown={Boolean(runProgress) || !running}
@@ -599,6 +625,8 @@ export default function Stage({
         selectedToken={selectedToken}
         highlightMessage={hoveredMessage}
         pulseEntryId={pulseEntryId}
+        fadingTail={fadeTail}
+        switching={justFinished || Boolean(whatIf)}
         onSelectEntry={selectEntry}
         onSelectToken={selectToken}
         onSelectMessage={(index) => (index == null ? clearSelection() : selectMessage(index))}

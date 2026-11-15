@@ -44,6 +44,8 @@ export default function TapeMap({
   onDragLens,
   maxRows = 8,
   pulseEntryId = null,
+  fadingTail = [],
+  switching = false,
 }) {
   const wrapRef = useRef(null)
   const [width, setWidth] = useState(900)
@@ -192,6 +194,23 @@ export default function TapeMap({
         rx={2}
       >
         <title>{cellTitle(token.position, token.piece, token.id)}</title>
+      </rect>
+    </g>
+  ))
+
+  // The thinking that was just produced, fading out of the tape right after
+  // the run finished (it is never sent again).
+  const fadingCells = fadingTail.map((token, index) => (
+    <g key={`fade-${token.index ?? index}`} className="m-fadeout">
+      <rect
+        className={token.channel === 'thinking' ? 'm-think' : 'm-asst'}
+        x={x(total + index) + 0.5}
+        y={tapeY}
+        width={Math.max(cellWidth - 1, 1)}
+        height={tapeH}
+        rx={2}
+      >
+        <title>{cellTitle(total + index, token.piece, token.id)}</title>
       </rect>
     </g>
   ))
@@ -347,7 +366,7 @@ export default function TapeMap({
   ) : null
 
   return (
-    <div className="map-wrap" ref={wrapRef} aria-label="Context tape and cache entry bars on one token-position ruler">
+    <div className={`map-wrap ${switching ? 'map-switch' : ''}`} ref={wrapRef} aria-label="Context tape and cache entry bars on one token-position ruler">
       <svg className="map" role="img" viewBox={`0 0 ${width} ${height}`} height={height}>
         <defs>
           <pattern id="m-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -365,6 +384,7 @@ export default function TapeMap({
         <text x="4" y={tapeY + 17} fontWeight={600}>Context</text>
         {tapeCells}
         {generatedCells}
+        {fadingCells}
         {hlOverlay}
         {lensGuide}
         {generatedTail.length > 0 && (

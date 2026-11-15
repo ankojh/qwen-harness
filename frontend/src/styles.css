@@ -671,3 +671,11 @@ svg.map .strip:hover .m-hit { fill: var(--accent); fill-opacity: .06; }
 .stage-legend .sw.info { background: var(--accent); }
 .stage-legend .sw.bad { background: repeating-linear-gradient(45deg, var(--danger) 0 3px, transparent 3px 6px); border: 1px solid var(--danger); }
 .stage .historical-label { color: var(--warn); font-size: 12px; font-weight: 600; }
+
+/* live behaviour: fade the thinking out of the tape after the run, and
+   fade the next-request map in when the view switches */
+svg.map .m-fadeout { animation: map-fadeout .9s ease-out forwards; }
+@keyframes map-fadeout { to { opacity: 0; } }
+.map-wrap.map-switch svg { animation: map-in .55s ease-out; }
+@keyframes map-in { from { opacity: .35; } to { opacity: 1; } }
+.pipe-mode { font-size: 11px; color: var(--muted); margin: 0; }
