@@ -81,7 +81,7 @@ export function addedPositions(prevIds, nextIds) {
 // Caption parts.  One array of segments: { kind: 'text' | 'ok' | 'info' |
 // 'bad' | 'warn' | 'code', text }.  The component renders them with the
 // same colour grammar as the map.
-function captionParts({ total, reused, chosen, computed, entries, reuseEnabled, historical, turnNumber }) {
+function captionParts({ total, reused, chosen, chosenRelabeled, computed, entries, reuseEnabled, historical, turnNumber }) {
   if (total === 0) {
     return [{ kind: 'text', text: 'Type a message to see its tokens on the tape.' }]
   }
@@ -96,7 +96,7 @@ function captionParts({ total, reused, chosen, computed, entries, reuseEnabled, 
       historical ? { kind: 'text', text: `Turn ${turnNumber}: ` } : null,
       { kind: 'ok', text: `restores ${reused} token${reused === 1 ? '' : 's'} from #${chosen.id}` },
       { kind: 'text', text: `, computes ${computed}` },
-      chosen.relabeled
+      (chosen.relabeled || chosenRelabeled)
         ? [{ kind: 'warn', text: ' · label ≠ state: the saved computation is from the original tokens' }]
         : [],
     ].flat().filter(Boolean)
@@ -171,9 +171,9 @@ export function buildMapModel({
     chosenRelabeled = Boolean(lookup?.relabeled)
   } else if (running) {
     reused = lookup?.reused_tokens ?? 0
-    const processTotal = progress?.total_tokens ?? prefill
-      ? (progress?.total_tokens ?? total - reused)
-      : total - reused
+    // Progress comes from prefill.chunk events; before any chunk arrives the
+    // band shows nothing computed yet.
+    const processTotal = progress?.total_tokens ?? total - reused
     computed = Math.min(progress?.processed_tokens ?? prefill?.processed_tokens ?? 0, processTotal)
     chosenEntryId = reused > 0 ? lookup?.entry_id ?? null : null
     chosenRelabeled = Boolean(lookup?.relabeled)
@@ -237,7 +237,7 @@ export function buildMapModel({
   const ghosts = prevEntries && !historical
     ? prevEntries
         .filter((entry) => !assessed.some((row) => row.id === entry.id))
-        .map((entry) => ({ ...assessEntry(entry, contextIds, reuseEnabled), ghost: true }))
+        .map((entry) => ({ ...assessEntry(entry, contextIds, reuseEnabled), ghost: true, usable: false }))
     : []
   const rows = [...ghosts, ...assessed].sort((a, b) => b.len - a.len)
 
@@ -273,6 +273,7 @@ export function buildMapModel({
         total,
         reused,
         chosen: chosen || null,
+        chosenRelabeled,
         computed,
         entries: rows,
         reuseEnabled,
