@@ -117,6 +117,13 @@ export default function Stage({
   const reuseEnabled = config.cache_reuse !== false
   const editing = staged != null
 
+  // The submitted request just finished and the preview hasn't refreshed yet:
+  // show the actual numbers with a confirmation mark (the switch to the
+  // next-request preview follows within about a second).
+  const justFinished =
+    !historical && !running && Boolean(generation?.finish) && generation.prompt &&
+    preview?.prompt_hash === generation.prompt?.prompt_hash && staged == null
+
   // A bubble click in the chat opens that message here.
   useEffect(() => {
     if (bubbleClick?.index != null && bubbleClick.index >= 0 && bubbleClick.index < session.messages.length) {
@@ -148,6 +155,12 @@ export default function Stage({
     wasRunningRef.current = running
     return undefined
   }, [running, tokens])
+
+  // Once the map has switched to the next-request preview, drop the fading
+  // cells so they never linger over the new tape.
+  useEffect(() => {
+    if (fadeTail.length > 0 && !justFinished && !running) setFadeTail([])
+  }, [justFinished, running, fadeTail])
 
   // Tell App whether a staged edit is open (blocks Send).
   useEffect(() => {
@@ -198,7 +211,13 @@ export default function Stage({
     return (cacheTokens || []).map((entry) => ({ ...rows.find((row) => row.id === entry.id), ...entry }))
   }, [historical, viewTurn, cacheTokens, state?.cache])
 
-  const prevEntries = prevTurn?.cache?.entries || null
+  const prevEntries = historical
+    ? null
+    : turns.length >= 2
+      ? prevTurn?.cache?.entries || null
+      : turns.length === 1
+        ? [] // the first turn started from an empty cache: everything is new
+        : null
   const generated = running ? tokens : []
   const lookup = historical
     ? viewTurn.cache?.last_lookup || null
@@ -234,12 +253,6 @@ export default function Stage({
     [report, mergedEntries, generated, lookup, prefill, progress, running, staged, reuseEnabled, historical, viewTurn, prevEntries, prevTurn, comparePrev],
   )
 
-  // The submitted request just finished and the preview hasn't refreshed yet:
-  // show the actual numbers with a confirmation mark (the switch to the
-  // next-request preview follows within about a second).
-  const justFinished =
-    !historical && !running && generation?.finish && generation.prompt &&
-    preview?.prompt_hash === generation.prompt?.prompt_hash && staged == null
   const captionExtra = justFinished
     ? [
         { kind: 'ok', text: ` ✓ the real prefill restored exactly ${generation.stats?.prefill?.reused_tokens ?? 0} — the prediction held` },
@@ -270,11 +283,9 @@ export default function Stage({
 
   const savedSummary = running
     ? runProgress?.saved || null
-    : !historical && prevEntries
+    : prevEntries
       ? { added: model.rows.filter((row) => row.isNew).length, evicted: model.ghosts.length }
-      : historical
-        ? null
-        : null
+      : null
 
   const lensModel = lensOverride != null ? { ...model, lensCenter: lensOverride } : model
   const selectedEntryRow = model.rows.find((row) => row.id === selectedEntryId) || null

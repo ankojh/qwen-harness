@@ -274,15 +274,19 @@ export default function TapeMap({
     const isSelected = row.id === selectedEntryId
     const isChosen = row.chosen
     const hasArrow = isChosen
+    const labelText = `#${row.id} ${row.ghost ? '' : kindLabel(row.kind)} · ${row.len}`
+    const shortLabel = labelText.length > 22 ? `${labelText.slice(0, 21)}…` : labelText
     entryRows.push(
       <g key={row.id} className="strip" tabIndex={0} role="button" aria-label={`Cache entry ${row.id}`}
         onClick={() => onSelectEntry?.(row.id)}
         onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectEntry?.(row.id) } }}>
         <rect className="m-hit" x={0} y={y - 4} width={width} height={barH + 8} />
         <text x={4} y={y + 13} fontWeight={isSelected ? 700 : 500} className={row.ghost ? 'm-mut' : undefined}>
-          {row.isNew ? <tspan className="m-infotext" fontWeight={700} fontSize={9}>NEW </tspan> : null}
-          #{row.id} {row.ghost ? 'evicted' : kindLabel(row.kind)} · {row.len}
+          {shortLabel}
         </text>
+        {row.isNew && !row.ghost && (
+          <text className="m-infotext" x={GUTTER - 6} y={y - 4} textAnchor="end" fontSize={9} fontWeight={700}>NEW</text>
+        )}
         {row.ghost && <text x={GUTTER - 4} y={y - 3} textAnchor="end" className="m-mut" fontSize={9}>evicted</text>}
         <rect
           className={`m-bar-ok ${row.ghost ? 'm-ghost' : ''}`}
@@ -312,11 +316,11 @@ export default function TapeMap({
         )}
         {row.breakAt == null && row.usable && !row.ghost && (
           <text className="m-oktext" x={x(row.len) + 6} y={y + 13} fontWeight={700}>
-            ✓ {isChosen ? 'restored' : 'usable'}{row.relabeled ? '  ⚠ label ≠ state' : ''}
+            ✓ {isChosen ? 'restored' : 'usable'}
           </text>
         )}
         {row.relabeled && (
-          <text className="m-warntext" x={x(row.len) + 6} y={row.breakAt == null ? y - 3 : y + 13} fontSize={10}>
+          <text className="m-warntext" x={x(row.len) + 6} y={row.breakAt == null ? y - 4 : y + 25} fontSize={10}>
             ⚠ label ≠ state
           </text>
         )}

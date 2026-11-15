@@ -52,7 +52,6 @@ export default function Conversation({
       assistantCount += 1
     }
   })
-
   const channels = generation?.channels ?? deriveChannels(tokens)
   const liveThinking = (tokens.length ? tokens : generation?.tokens || []).filter(
     (token) => token.channel === 'thinking',
@@ -110,7 +109,7 @@ export default function Conversation({
         <textarea
           rows={3}
           value={draft}
-          placeholder={turns === 0 ? 'Say something to the model…' : 'Next message…'}
+          placeholder={turns.length === 0 ? 'Say something to the model…' : 'Next message…'}
           onChange={(event) => onDraftChange(event.target.value)}
           onKeyDown={handleKeyDown}
         />
@@ -131,7 +130,7 @@ export default function Conversation({
           <button type="button" disabled={!running} onClick={onStop}>Stop</button>
           <span className="muted small">Enter to send · Shift+Enter for a new line</span>
           <span className="spacer" />
-          <span className="muted small">{turns} {turns === 1 ? 'turn' : 'turns'}</span>
+          <span className="muted small">{turns.length} {turns.length === 1 ? 'turn' : 'turns'}</span>
           <button type="button" disabled={busy} onClick={onNewConversation}>New conversation</button>
         </div>
       </div>

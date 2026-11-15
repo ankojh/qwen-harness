@@ -20,6 +20,7 @@ export default function Pipeline({ model, lookupKnown, running, savedSummary }) 
         ? '—'
         : 'no match'
 
+  const savedActive = savedSummary && (savedSummary.added > 0 || savedSummary.evicted > 0)
   const nodes = [
     {
       key: 'messages',
@@ -55,13 +56,11 @@ export default function Pipeline({ model, lookupKnown, running, savedSummary }) 
     {
       key: 'saved',
       label: 'Saved',
-      value: savedSummary
+      value: savedActive
         ? `+${savedSummary.added}${savedSummary.evicted ? `, −${savedSummary.evicted} evicted` : ''}`
-        : phase === 'turn'
-          ? `${savedSummary ? savedSummary.added : '0'} new`
-          : '—',
+        : '—',
       sub: 'new cache entries',
-      tone: savedSummary && savedSummary.added > 0 ? 'ok' : '',
+      tone: savedActive ? 'ok' : '',
     },
   ]
 

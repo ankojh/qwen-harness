@@ -284,15 +284,16 @@ export default function App() {
   }, [nextSession])
 
   // Auto-refresh calls the tokenizer only, never the model.  It also reruns
-  // when the cache changes, so the reuse prediction stays current.
+  // when the cache changes, so the reuse prediction stays current.  The
+  // previous report stays on screen until the new one arrives: the tape
+  // redraws in place instead of flashing empty (the moment after a run is
+  // the animated switch the map teaches with).
   useEffect(() => {
     if (activeGenId) return undefined
     if (!autoPreview || !state?.model_loaded) {
       setPreview(null)
       return undefined
     }
-    setPreview(null)
-    setPreviewError(null)
     if (!hasContext) {
       setPreview(null)
       setPreviewError(null)
@@ -463,13 +464,18 @@ export default function App() {
     }
     setViewTurnId(null)
     setSession(next)
-    // Keep the preview of the submitted request: it freezes the tape on the
-    // prompt while the run is in flight (auto-preview pauses during a run).
+    // Fetch the submitted request's report immediately (the debounced preview
+    // may not have landed yet, and auto-preview pauses during the run): it
+    // freezes the tape on the prompt while the run is in flight.
     setDraft('')
     setLastInput(text)
     setActionError(null)
     try {
-      const response = await startGeneration(newRequestId(), next)
+      const [response, submittedReport] = await Promise.all([
+        startGeneration(newRequestId(), next),
+        previewPrompt(next).catch(() => null),
+      ])
+      if (submittedReport) setPreview(submittedReport)
       pendingTurnRef.current = response.generation_id
       activeGenRef.current = response.generation_id
       setActiveGenId(response.generation_id)
@@ -591,7 +597,7 @@ export default function App() {
                 session={session}
                 draft={draft}
                 onDraftChange={setDraft}
-                turns={turns.length}
+                turns={turns}
                 modelLoaded={modelLoaded}
                 running={running}
                 busy={busy || editing}

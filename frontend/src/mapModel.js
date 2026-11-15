@@ -14,7 +14,7 @@ import { commonPrefix, lcsRanges } from './turnDiffs.js'
 export const KIND_LABEL = {
   checkpoint: 'checkpoint',
   manual: 'saved by you',
-  'after-generation': 'after reply',
+  'after-generation': 'after-reply',
 }
 
 export function kindLabel(kind) {

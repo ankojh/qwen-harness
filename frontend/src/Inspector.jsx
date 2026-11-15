@@ -289,7 +289,7 @@ function MessagePane({
       )}
       {!isEditing && !historical && (
         <div className="button-row">
-          <button type="button" className="primary" disabled={busy} onClick={onBeginEdit}>
+          <button type="button" className="primary" disabled={busy} onClick={() => onBeginEdit(messageIndex)}>
             Edit this message
           </button>
         </div>
