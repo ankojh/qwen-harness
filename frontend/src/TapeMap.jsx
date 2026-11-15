@@ -355,6 +355,11 @@ export default function TapeMap({
             · {row.len}
           </text>
         )}
+        {past === 0 && row.breakAt != null && !row.ghost && (
+          <text className="m-mut" x={x(row.len) + 6} y={y + 13} fontSize={10}>
+            · {row.len}
+          </text>
+        )}
         {row.relabeled && (
           <text className="m-warntext" x={x(barEnd) + 6} y={row.breakAt == null ? y - 4 : y + 26} fontSize={10}>
             ⚠ label ≠ state
