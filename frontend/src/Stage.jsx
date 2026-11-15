@@ -6,6 +6,7 @@ import Lens from './Lens.jsx'
 import Inspector from './Inspector.jsx'
 import Timeline from './Timeline.jsx'
 import { buildMapModel } from './mapModel.js'
+import ReuseExplainer from './ReuseExplainer.jsx'
 import { stopsMatching } from './turnDiffs.js'
 import { formatBytes } from './ConfigPanel.jsx'
 import {
@@ -212,6 +213,7 @@ export default function Stage({
         prevIds: prevTurn?.context?.token_ids || null,
         comparePrev: comparePrev && !historical,
         historyCounts: historical ? { thinking: viewTurn?.thinking || 0, answer: (viewTurn?.generated || 0) - (viewTurn?.thinking || 0) } : null,
+        cacheKnown: historical || cacheTokens !== null,
       }),
     [report, mergedEntries, generated, lookup, prefill, progress, running, staged, reuseEnabled, historical, viewTurn, prevEntries, prevTurn, comparePrev],
   )
@@ -707,6 +709,8 @@ export default function Stage({
         onSelect={(id) => { clearSelection(); setStaged(null); onViewTurnChange(id) }}
         disabled={editing || running}
       />
+
+      <ReuseExplainer />
 
       {!modelLoaded && (
         <div className="note note-warn row-between">

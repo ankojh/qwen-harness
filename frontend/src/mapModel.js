@@ -149,6 +149,7 @@ export function buildMapModel({
   comparePrev = false,
   historyCounts = null,  // {thinking, answer} for a finished historical turn
   savedSummary = null,   // {added, evicted, checkpoints} cache changes during this run
+  cacheKnown = true,     // false while the live entry token lists are still loading
 }) {
   const contextIds = report?.token_ids || []
   const pieces = report?.token_pieces || []
@@ -181,6 +182,14 @@ export function buildMapModel({
     computed = total - reused
     chosenEntryId = reused > 0 ? prediction?.entry_id ?? null : null
     chosenRelabeled = Boolean(prediction?.relabeled)
+  }
+  // With reuse off the band is all blue and nothing is restored, whatever a
+  // stale prediction might claim.
+  if (!reuseEnabled) {
+    reused = 0
+    computed = total
+    chosenEntryId = null
+    chosenRelabeled = false
   }
 
   // ---- tape ---------------------------------------------------------------
@@ -258,16 +267,18 @@ export function buildMapModel({
   } else phase = 'next'
 
   // ---- caption ---------------------------------------------------------------
-  const caption = captionParts({
-    total,
-    reused,
-    chosen: chosen || null,
-    computed,
-    entries: rows,
-    reuseEnabled,
-    historical,
-    turnNumber,
-  })
+  const caption = !cacheKnown && entries.length === 0 && total > 0
+    ? [{ kind: 'text', text: 'reading the saved states on the server…' }]
+    : captionParts({
+        total,
+        reused,
+        chosen: chosen || null,
+        computed,
+        entries: rows,
+        reuseEnabled,
+        historical,
+        turnNumber,
+      })
 
   for (const warning of warnings) {
     // A disagreement between the client rule and the server is a bug: the

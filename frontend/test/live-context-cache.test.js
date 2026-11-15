@@ -4,10 +4,10 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
 import { diffCaches, lcsRanges } from '../src/turnDiffs.js'
+import { buildMapModel } from '../src/mapModel.js'
 
 let vite
-let CacheMatch
-let CachePanel
+let Stage
 let App
 
 before(async () => {
@@ -16,8 +16,7 @@ before(async () => {
     optimizeDeps: { noDiscovery: true, include: [] },
     server: { middlewareMode: true },
   })
-  ;({ default: CacheMatch } = await vite.ssrLoadModule('/src/CacheMatch.jsx'))
-  ;({ default: CachePanel } = await vite.ssrLoadModule('/src/CachePanel.jsx'))
+  ;({ default: Stage } = await vite.ssrLoadModule('/src/Stage.jsx'))
   ;({ default: App } = await vite.ssrLoadModule('/src/App.jsx'))
 })
 
@@ -25,69 +24,197 @@ after(async () => {
   await vite?.close()
 })
 
+// A two-turn conversation: context 2 shares a 10-token prefix with entry #1.
+const T2 = ['<|im_start|>', 'user', '\n', 'My', ' name', ' is', ' Alice', '.', '<|im_end|>', '\n', '<|im_start|>', 'assistant', '\n', 'Nice', ' to', ' meet', ' you', ',', ' Alice', '!', '<|im_end|>', '\n', '<|im_start|>', 'user', '\n', 'What', ' is', ' my', ' name', '?', '<|im_end|>', '\n', '<|im_start|>', 'assistant', '\n', '<think>', '\n']
+const ENTRY1 = T2.slice(0, 10)
 const report = {
-  token_ids: [10, 11, 12, 13],
-  token_pieces: [10, 11, 12, 13].map((id) => ({ id, piece: `piece-${id}`, text: `piece-${id}` })),
-  cache_prediction: {
-    entry_id: 7,
-    reused_tokens: 2,
-    reason: 'would reuse 2 of 4 tokens from checkpoint entry #7',
-  },
-  cache_entries: [{
-    id: 7,
-    kind: 'checkpoint',
-    tokens: 3,
-    shared_prefix: 2,
-    reusable_tokens: 2,
-    reason: 'First different token at position 2.',
-    token_window: [10, 11, 99].map((id, position) => ({ position, id, piece: `piece-${id}` })),
-  }],
+  token_ids: T2,
+  token_pieces: T2.map((piece, index) => ({ id: index + 100, piece, text: piece, special: piece.startsWith('<') })),
+  spans: [
+    { role: 'user', index: 1, start: 0, end: 10, kind: 'message' },
+    { role: 'assistant', index: 2, start: 10, end: 22, kind: 'message' },
+    { role: 'user', index: 3, start: 22, end: 32, kind: 'message' },
+    { role: 'assistant', start: 32, end: 37, kind: 'opener' },
+  ],
+  cache_prediction: { entry_id: 1, reused_tokens: 10, reason: 'would reuse 10 of 37 tokens from checkpoint entry #1' },
+  cache_entries: [],
 }
 
-describe('live context and cache UI', () => {
+function stageProps(overrides = {}) {
+  return {
+    state: {
+      config: { cache_reuse: true, cache_checkpoints: 'last_message', system_prompt: '' },
+      cache: {
+        entries: [
+          { id: 1, kind: 'checkpoint', tokens: 10, nbytes: 5_000_000, age_seconds: 5, relabels: 0 },
+          { id: 2, kind: 'after-generation', tokens: 13, nbytes: 6_000_000, age_seconds: 2, relabels: 0 },
+        ],
+        total_bytes: 11_000_000,
+        limit_bytes: 2_147_483_648,
+        utilization: 0.01,
+        evictions_total: 0,
+      },
+      model_loaded: true,
+    },
+    session: { mode: 'messages', messages: [] },
+    draft: '',
+    preview: report,
+    previewError: null,
+    generation: null,
+    tokens: [],
+    running: false,
+    busy: false,
+    modelLoaded: true,
+    turns: [],
+    viewTurn: null,
+    viewTurnId: null,
+    prevTurn: null,
+    pendingEdits: [],
+    systemPrompt: '',
+    runProgress: null,
+    hoveredMessage: null,
+    bubbleClick: null,
+    onViewTurnChange() {},
+    onApplyStaged() {},
+    onCacheAction() {},
+    onConfigChange() {},
+    onClearCache() {},
+    onEditingChange() {},
+    onLoadModel() {},
+    ...overrides,
+  }
+}
+
+describe('the visual stage', () => {
   it('renders the App startup state without a temporal-dead-zone failure', () => {
     const html = renderToStaticMarkup(React.createElement(App))
     assert.match(html, /Qwen Harness/)
     assert.match(html, /connecting to the local backend/)
   })
 
-  it('renders exact token positions and IDs around the cache match boundary', () => {
-    const html = renderToStaticMarkup(
-      React.createElement(CacheMatch, { report, reuseEnabled: true, running: false }),
-    )
-    assert.match(html, /Next request: 2 tokens of computation reusable · 2 to process/)
-    assert.match(html, /positions 0–1/)
-    assert.match(html, /First different token at position 2/)
-    assert.match(html, /<td>0<\/td>/)
-    assert.match(html, /<td>2<\/td>/)
-    assert.match(html, /ID 10/)
-    assert.match(html, /ID 99/)
-    assert.match(html, /≠ first difference/)
+  it('draws the ruler, the pipeline and the caption with the server reuse numbers', () => {
+    const html = renderToStaticMarkup(React.createElement(Stage, stageProps()))
+    assert.match(html, /position<\/text>/)
+    assert.match(html, /Cache lookup/)
+    assert.match(html, />10 from #1</)
+    assert.match(html, /CACHE ENTRIES \(saved states\)/)
+    assert.match(html, /Context<\/text>/)
+    assert.match(html, /reuse<\/label>|reuse/)
   })
 
-  it('keeps entry match metadata visible when cache reuse is disabled', () => {
-    const disabledReport = {
-      ...report,
-      cache_prediction: { ...report.cache_prediction, reused_tokens: 0, reason: 'Cache reuse is OFF.' },
-    }
-    const html = renderToStaticMarkup(
-      React.createElement(CacheMatch, { report: disabledReport, reuseEnabled: false, running: false }),
-    )
-    assert.match(html, /Next request: 0 tokens of computation reusable · 4 to process/)
-    assert.match(html, /Reuse is OFF\. Matching entries are still shown for comparison\./)
-    assert.match(html, /2 tokens of usable saved state \(disabled\)/)
-    assert.match(html, /2 matching · 2 usable/)
+  it('shows the reuse-off caption and still draws the bars', () => {
+    const model = buildMapModel({
+      report,
+      entries: [{ id: 1, kind: 'checkpoint', token_ids: ENTRY1 }],
+      reuseEnabled: false,
+    })
+    assert.equal(model.reused, 0)
+    const text = model.caption.map((part) => part.text).join('')
+    assert.match(text, /reuse is off/)
+    assert.equal(model.rows.length, 1)
+    assert.equal(model.rows[0].breakAt, null)
+    assert.equal(model.rows[0].match, 10)
   })
 
-  it('renders the no-cache state when there are no saved entries', () => {
+  it('renders the empty page: ghost ruler, empty tape, no saved states', () => {
     const html = renderToStaticMarkup(
-      React.createElement(CacheMatch, {
-        report: { token_ids: [1], cache_prediction: null, cache_entries: [] },
+      React.createElement(Stage, stageProps({
+        preview: { token_ids: [], token_pieces: [], spans: [], cache_prediction: null, cache_entries: [] },
+        state: { config: {}, cache: { entries: [], total_bytes: 0, limit_bytes: 2000, utilization: 0 }, model_loaded: true },
+      })),
+    )
+    assert.match(html, /type a message to see its tokens/)
+    assert.match(html, /no saved states yet/)
+  })
+
+  it('renders a historical turn read-only with its recorded reuse', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(Stage, stageProps({
+        viewTurn: {
+          id: 'turn-1',
+          n: 1,
+          input: 37,
+          reused: 10,
+          generated: 8,
+          thinking: 0,
+          context: report,
+          cache: {
+            entries: [{ id: 1, kind: 'checkpoint', tokens: 10, token_ids: ENTRY1, nbytes: 5_000_000 }],
+            total_bytes: 5_000_000,
+            last_lookup: { entry_id: 1, reused_tokens: 10, reason: 'reused 10 tokens from checkpoint entry #1' },
+          },
+          edits: [],
+        },
+        viewTurnId: 'turn-1',
+      })),
+    )
+    assert.match(html, /Historical snapshot · read-only/)
+    assert.match(html, /Turn 1/)
+  })
+})
+
+describe('the map view model (plan cases)', () => {
+  it('marks a full-prefix entry usable and chosen; the longest match breaks at the first difference', () => {
+    const model = buildMapModel({
+      report,
+      entries: [
+        { id: 1, kind: 'checkpoint', token_ids: ENTRY1 },
+        { id: 2, kind: 'after-generation', token_ids: [...T2.slice(0, 13), '<think>', 'x'] },
+      ],
+      reuseEnabled: true,
+    })
+    assert.equal(model.reused, 10)
+    assert.equal(model.computed, 27)
+    const entry1 = model.rows.find((row) => row.id === 1)
+    assert.equal(entry1.match, 10)
+    assert.equal(entry1.breakAt, null)
+    assert.equal(entry1.usable, true)
+    assert.equal(entry1.chosen, true)
+    const entry2 = model.rows.find((row) => row.id === 2)
+    assert.equal(entry2.breakAt, 13)
+    assert.equal(entry2.usable, false)
+  })
+
+  it('an edit at position 6 breaks every bar and drops reuse to 0', () => {
+    const edited = T2.map((piece, index) => (index === 6 ? ' Bob' : piece))
+    const model = buildMapModel({
+      report: {
+        token_ids: edited,
+        token_pieces: edited.map((piece, index) => ({ id: index + 100, piece, text: piece })),
+        spans: report.spans,
+        cache_prediction: { entry_id: null, reused_tokens: 0, reason: 'no compatible cache entry' },
+        cache_entries: [],
+      },
+      entries: [{ id: 1, kind: 'checkpoint', token_ids: ENTRY1 }],
+      reuseEnabled: true,
+    })
+    assert.equal(model.reused, 0)
+    const entry = model.rows[0]
+    assert.equal(entry.match, 6)
+    assert.equal(entry.breakAt, 6)
+    assert.equal(entry.usable, false)
+    assert.match(model.caption.map((part) => part.text).join(''), /matches to position 6 then breaks/)
+  })
+
+  it('warns when the client rule disagrees with the server assessment', () => {
+    const originalWarn = console.warn
+    const warnings = []
+    console.warn = (message) => warnings.push(message)
+    try {
+      buildMapModel({
+        report: {
+          ...report,
+          // The server claims this full-prefix entry cannot be reused.
+          cache_entries: [{ id: 1, kind: 'checkpoint', tokens: 10, shared_prefix: 10, reusable_tokens: 0, reason: 'x' }],
+        },
+        entries: [{ id: 1, kind: 'checkpoint', token_ids: ENTRY1 }],
         reuseEnabled: true,
-        running: false,
-      }),
-    )
-    assert.match(html, /No saved states yet/)
+      })
+    } finally {
+      console.warn = originalWarn
+    }
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /disagrees with the server/)
   })
 })
 
@@ -142,46 +269,5 @@ describe('long context token diffs', () => {
       added: [{ start: 20, end: 1520 }],
       approximate: true,
     })
-  })
-})
-
-describe('historical cache panel', () => {
-  it('uses the selected turn prefill stats and disables clearing the live cache', () => {
-    const html = renderToStaticMarkup(React.createElement(CachePanel, {
-      state: {
-        config: { cache_reuse: true, cache_checkpoints: 'last_message' },
-        cache: { entries: [], total_bytes: 900, limit_bytes: 2000, utilization: 0.45, evictions_total: 3 },
-      },
-      preview: null,
-      previewError: null,
-      running: false,
-      generation: {
-        prompt: { token_ids: Array.from({ length: 80 }, (_, index) => index) },
-        stats: { prefill: { processed_tokens: 42, seconds: 9.9 } },
-      },
-      busy: false,
-      onClearCache: () => {},
-      viewTurn: {
-        id: 'turn-1',
-        prefill: { processed_tokens: 7, seconds: 1.2 },
-        finish: { phase: 'decode' },
-        context: { token_ids: Array.from({ length: 9 }, (_, index) => index) },
-        cache: {
-          entries: [{ id: 8, kind: 'checkpoint', tokens: 8, token_ids: Array.from({ length: 8 }, (_, index) => index), nbytes: 400 }],
-          total_bytes: 400,
-          last_lookup: { entry_id: 8, reused_tokens: 1, reason: 'fixture lookup' },
-        },
-        edits: [],
-      },
-      prevTurn: null,
-      pendingEdits: [],
-      onConfigChange: () => {},
-      onCacheAction: () => {},
-    }))
-
-    assert.match(html, /Last actual request · reused 1 tokens · processed 8 input tokens/)
-    assert.match(html, /Input processing before the final token: 7 tokens in 1\.2s/)
-    assert.doesNotMatch(html, /42 tokens in 9\.9s/)
-    assert.match(html, /<button[^>]*disabled=""[^>]*>Clear cache<\/button>/)
   })
 })
