@@ -4,10 +4,8 @@ import ConfigPanel from './ConfigPanel.jsx'
 import InputPanel from './InputPanel.jsx'
 import OutputPanel from './OutputPanel.jsx'
 import EventLog from './EventLog.jsx'
-import ChatInput from './ChatInput.jsx'
-import LiveOutput from './LiveOutput.jsx'
-import ContextPanel from './ContextPanel.jsx'
-import CachePanel from './CachePanel.jsx'
+import Conversation from './Conversation.jsx'
+import Stage from './Stage.jsx'
 import {
   clearCache,
   formatError,
@@ -45,38 +43,7 @@ function newRequestId() {
 }
 
 // Turns 1..N (their recorded snapshots) plus Next (the request being typed).
-function TurnSelector({ turns, viewTurnId, onSelect, editing }) {
-  return (
-    <div className="history-bar">
-      <button type="button" className={viewTurnId === null ? 'active' : ''} disabled={editing} onClick={() => onSelect(null)}>Current state</button>
-      {viewTurnId !== null && <strong className="historical-label">Historical snapshot · read-only</strong>}
-      <details><summary>History & changes ({turns.length} turns)</summary>
-      <div className="turn-selector">
-      <span className="muted">Recorded requests</span>
-      {turns.map((turn) => (
-        <button
-          key={turn.id}
-          type="button"
-          disabled={editing}
-          className={viewTurnId === turn.id ? 'active' : ''}
-          onClick={() => onSelect(viewTurnId === turn.id ? null : turn.id)}
-        >
-          Turn {turn.n}
-        </button>
-      ))}
-      <button
-        type="button"
-        className={viewTurnId === null ? 'active' : ''}
-        disabled={editing}
-        onClick={() => onSelect(null)}
-      >
-        Return to current
-      </button>
-      {turns.length === 0 && <span className="muted">Send a message to record a turn.</span>}
-      </div></details>
-    </div>
-  )
-}
+// Rendered by the Stage's folded timeline; kept here for the record.
 
 export default function App() {
   const [state, setState] = useState(null)
@@ -109,6 +76,13 @@ export default function App() {
   // next recorded turn takes them and clears the list.
   const [pendingEdits, setPendingEdits] = useState([])
   const pendingEditsRef = useRef([])
+  // SSE progress of the running generation: the lookup event, the latest
+  // prefill chunk, and the cache changes, for the pipeline/map live view.
+  const [runProgress, setRunProgress] = useState(null)
+  // Which message the chat bubbles are hovering (lights its tape segment).
+  const [hoveredMessage, setHoveredMessage] = useState(null)
+  // A bubble was clicked: {index, seq}; the Stage opens it in the Inspector.
+  const [bubbleClick, setBubbleClick] = useState(null)
 
   const logEdit = useCallback((line) => {
     pendingEditsRef.current = [...pendingEditsRef.current, line]
@@ -244,6 +218,24 @@ export default function App() {
           setGeneration(null)
           setTokens([])
           setActionError(null)
+          setRunProgress({})
+        } else if (type === 'cache.lookup') {
+          setRunProgress((previous) => (previous ? { ...previous, lookup: data } : previous))
+        } else if (type === 'prefill.chunk') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            prefill: { processed_tokens: data.processed_tokens, total_tokens: data.total_tokens },
+          } : previous)
+        } else if (type === 'cache.insert') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            saved: { ...(previous.saved || { added: 0, evicted: 0 }), added: (previous.saved?.added || 0) + 1 },
+          } : previous)
+        } else if (type === 'cache.evict') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            saved: { ...(previous.saved || { added: 0, evicted: 0 }), evicted: (previous.saved?.evicted || 0) + 1 },
+          } : previous)
         } else if (type === 'generation.finished') {
           if (activeGenRef.current === data.generation_id) activeGenRef.current = null
           setActiveGenId(null)
@@ -471,7 +463,8 @@ export default function App() {
     }
     setViewTurnId(null)
     setSession(next)
-    setPreview(null)
+    // Keep the preview of the submitted request: it freezes the tape on the
+    // prompt while the run is in flight (auto-preview pauses during a run).
     setDraft('')
     setLastInput(text)
     setActionError(null)
@@ -502,6 +495,7 @@ export default function App() {
     setGeneration(null)
     setTokens([])
     setPreview(null)
+    setRunProgress(null)
   }
 
   async function handleStop() {
@@ -590,86 +584,66 @@ export default function App() {
 
       <div className="main">
         <PanelGroup direction="horizontal" style={{ height: '100%' }}>
-          <Panel defaultSize={34} minSize={25}>
-            <PanelGroup direction="vertical" style={{ height: '100%' }}>
-              <Panel defaultSize={28} minSize={15}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Input</div>
-                  <ChatInput
-                    draft={draft}
-                    onDraftChange={setDraft}
-                    turns={turns.length}
-                    modelLoaded={modelLoaded}
-                    running={running}
-                    busy={busy || editing}
-                    editing={editing}
-                    onSend={handleSend}
-                    onStop={handleStop}
-                    onNewConversation={handleNewConversation}
-                    onLoadModel={() => handleModel('load')}
-                  />
-                </div>
-              </Panel>
-              <PanelResizeHandle className="resize horizontal" />
-              <Panel defaultSize={72} minSize={20}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Output</div>
-                  <LiveOutput generation={generation} tokens={tokens} running={running} lastInput={lastInput} />
-                </div>
-              </Panel>
-            </PanelGroup>
+          <Panel defaultSize={30} minSize={22}>
+            <div className="panel-scroll">
+              <div className="panel-title">Conversation</div>
+              <Conversation
+                session={session}
+                draft={draft}
+                onDraftChange={setDraft}
+                turns={turns.length}
+                modelLoaded={modelLoaded}
+                running={running}
+                busy={busy || editing}
+                editing={editing}
+                generation={generation}
+                tokens={tokens}
+                hoveredMessage={hoveredMessage}
+                onHoverMessage={setHoveredMessage}
+                onSelectMessage={(index) => setBubbleClick((previous) => ({ index, seq: (previous?.seq || 0) + 1 }))}
+                onSend={handleSend}
+                onStop={handleStop}
+                onNewConversation={handleNewConversation}
+                onLoadModel={() => handleModel('load')}
+              />
+            </div>
           </Panel>
 
           <PanelResizeHandle className="resize vertical" />
 
-          <Panel defaultSize={66} minSize={35}>
-            <div className="right-column">
-              <TurnSelector turns={turns} viewTurnId={viewTurnId} onSelect={setViewTurnId} editing={editing} />
-              <PanelGroup direction="vertical" style={{ flex: 1, minHeight: 0 }}>
-                <Panel defaultSize={44} minSize={15}>
-                  <div className="panel-scroll">
-                    <div className="panel-title">Context {viewTurn ? `at turn ${viewTurn.n}` : 'now'} <span className="title-note">message text in this tab → full token sequence sent</span></div>
-                    <ContextPanel
-                      preview={preview}
-                      previewError={previewError}
-                      session={session}
-                      draft={draft}
-                      turns={turns}
-                      modelLoaded={modelLoaded}
-                      running={running}
-                      viewTurn={viewTurn}
-                      prevTurn={prevTurn}
-                      pendingEdits={pendingEdits}
-                      systemPrompt={state.config?.system_prompt || ''}
-                      cacheState={state.cache}
-                      config={state.config}
-                      onEditingChange={setEditing}
-                      onApplyStaged={applyStagedSession}
-                      onCacheAction={runCacheAction}
-                    />
-                  </div>
-                </Panel>
-                <PanelResizeHandle className="resize horizontal" />
-                <Panel defaultSize={56} minSize={15}>
-                  <div className="panel-scroll">
-                    <div className="panel-title">Cache {viewTurn ? `after turn ${viewTurn.n}` : 'now'} <span className="title-note">computed model state saved on the server</span></div>
-                    <CachePanel
-                      state={state}
-                      preview={running ? generation?.prompt || preview : preview}
-                      previewError={previewError}
-                      running={running}
-                      generation={generation}
-                      busy={busy}
-                      onClearCache={handleClearCache}
-                      viewTurn={viewTurn}
-                      prevTurn={prevTurn}
-                      pendingEdits={pendingEdits}
-                      onConfigChange={updateConfig}
-                      onCacheAction={runCacheAction}
-                    />
-                  </div>
-                </Panel>
-              </PanelGroup>
+          <Panel defaultSize={70} minSize={35}>
+            <div className="panel-scroll">
+              <div className="panel-title">
+                What the model sees <span className="title-note">one ruler: the context tape, the restored/computed band, and every saved state</span>
+              </div>
+              <Stage
+                state={state}
+                session={session}
+                draft={draft}
+                preview={preview}
+                previewError={previewError}
+                generation={generation}
+                tokens={tokens}
+                running={running}
+                busy={busy}
+                modelLoaded={modelLoaded}
+                turns={turns}
+                viewTurn={viewTurn}
+                viewTurnId={viewTurnId}
+                prevTurn={prevTurn}
+                pendingEdits={pendingEdits}
+                systemPrompt={state.config?.system_prompt || ''}
+                runProgress={runProgress}
+                hoveredMessage={hoveredMessage}
+                bubbleClick={bubbleClick}
+                onViewTurnChange={setViewTurnId}
+                onApplyStaged={applyStagedSession}
+                onCacheAction={runCacheAction}
+                onConfigChange={updateConfig}
+                onClearCache={handleClearCache}
+                onEditingChange={setEditing}
+                onLoadModel={() => handleModel('load')}
+              />
             </div>
           </Panel>
         </PanelGroup>

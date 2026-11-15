@@ -182,8 +182,7 @@ export default function TapeMap({
     }
   }
 
-  const generatedCells = generatedTail.map((token) => (
-    <g key={`gen-${token.position}`}>
+  const generatedCells = generatedTail.map((token) => (    <g key={`gen-${token.position}`}>
       <rect
         className={token.channel === 'thinking' ? 'm-think' : 'm-asst'}
         x={x(token.position) + 0.5}
@@ -196,6 +195,24 @@ export default function TapeMap({
       </rect>
     </g>
   ))
+
+  const emptyTape = total === 0 && generatedTail.length === 0 ? (
+    <g>
+      <rect
+        x={GUTTER + 0.5}
+        y={tapeY}
+        width={plot - 1}
+        height={tapeH}
+        rx={2}
+        fill="none"
+        stroke="var(--border)"
+        strokeDasharray="5 4"
+      />
+      <text className="m-mut" x={GUTTER + plot / 2} y={tapeY + 17} textAnchor="middle">
+        type a message to see its tokens
+      </text>
+    </g>
+  ) : null
 
   const tickMarks = rulerStep > 0 ? (() => {
     const marks = []
@@ -344,6 +361,7 @@ export default function TapeMap({
         <text className="m-mut" x="4" y={13}>position</text>
         {tickMarks}
         {plusTicks}
+        {emptyTape}
         <text x="4" y={tapeY + 17} fontWeight={600}>Context</text>
         {tapeCells}
         {generatedCells}

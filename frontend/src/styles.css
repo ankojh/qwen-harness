@@ -661,3 +661,13 @@ svg.map .strip:hover .m-hit { fill: var(--accent); fill-opacity: .06; }
 .reuse-explainer .mini-map svg { width: 100%; }
 .reuse-explainer .mini-map p { margin: 2px 0; }
 .reuse-explainer .mini-map h5 { margin: 2px 0; font-size: 12px; }
+
+/* stage cache header + legend swatches */
+.cache-head { border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; background: var(--panel); }
+.cache-head .button-row { gap: 10px; }
+.stage-legend .sw.tpl { background: var(--border-subtle); border: 1px solid var(--border); }
+.stage-legend .sw.think { background: color-mix(in srgb, var(--think) 40%, transparent); border: 1px dashed var(--think); }
+.stage-legend .sw.ok { background: var(--ok); }
+.stage-legend .sw.info { background: var(--accent); }
+.stage-legend .sw.bad { background: repeating-linear-gradient(45deg, var(--danger) 0 3px, transparent 3px 6px); border: 1px solid var(--danger); }
+.stage .historical-label { color: var(--warn); font-size: 12px; font-weight: 600; }

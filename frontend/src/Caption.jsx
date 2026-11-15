@@ -5,10 +5,11 @@
 
 const KIND_CLASS = { ok: 'g', info: 'b', bad: 'r', warn: 'w' }
 
-export default function Caption({ model, ariaLabel }) {
+export default function Caption({ model, extra = [], ariaLabel }) {
+  const parts = [...model.caption, ...extra]
   return (
     <p className="caption" aria-live="polite" aria-label={ariaLabel}>
-      {model.caption.map((part, index) => {
+      {parts.map((part, index) => {
         if (part.kind === 'code') {
           return <code key={index}>{part.text}</code>
         }
