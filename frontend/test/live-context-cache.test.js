@@ -353,7 +353,7 @@ describe('TapeMap (SSR)', () => {
       comparePrev: true,
     })
     const html = render(model)
-    assert.match(html, />NEW</)
+    assert.match(html, />NEW <\/tspan>/)
     assert.match(html, />evicted</)
     assert.match(html, /class="m-ghost"|m-ghost/)
     assert.equal((html.match(/>\+<\/text>/g) || []).length, model.ticks.length)

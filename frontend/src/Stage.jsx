@@ -110,6 +110,7 @@ export default function Stage({
   const [stagedPreviewError, setStagedPreviewError] = useState(null)
   const [pulseEntryId, setPulseEntryId] = useState(null)
   const [fadeTail, setFadeTail] = useState([])
+  const [fit, setFit] = useState('context')
   const wasRunningRef = useRef(false)
 
   const historical = Boolean(viewTurn)
@@ -619,6 +620,23 @@ export default function Stage({
           >
             compare with last turn
           </button>
+          <span className="muted small">fit</span>
+          <button
+            type="button"
+            className={fit === 'context' ? 'active' : ''}
+            title="keep the ruler on the context; bars longer than the view tear off at the edge"
+            onClick={() => setFit('context')}
+          >
+            context
+          </button>
+          <button
+            type="button"
+            className={fit === 'all' ? 'active' : ''}
+            title="stretch the ruler to the longest saved state"
+            onClick={() => setFit('all')}
+          >
+            everything
+          </button>
           <button
             type="button"
             className="mini"
@@ -638,6 +656,7 @@ export default function Stage({
         pulseEntryId={pulseEntryId}
         fadingTail={fadeTail}
         switching={justFinished || Boolean(whatIf)}
+        fit={fit}
         onSelectEntry={selectEntry}
         onSelectToken={selectToken}
         onSelectMessage={(index) => (index == null ? clearSelection() : selectMessage(index))}

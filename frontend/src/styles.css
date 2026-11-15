@@ -679,3 +679,6 @@ svg.map .m-fadeout { animation: map-fadeout .9s ease-out forwards; }
 .map-wrap.map-switch svg { animation: map-in .55s ease-out; }
 @keyframes map-in { from { opacity: .35; } to { opacity: 1; } }
 .pipe-mode { font-size: 11px; color: var(--muted); margin: 0; }
+
+/* bars torn off at the right edge when the domain fits the context */
+svg.map .m-torn { fill: none; stroke: var(--muted); stroke-width: 1; }
