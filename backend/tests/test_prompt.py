@@ -9,6 +9,7 @@ template drops once a later user message exists.
 
 from config import AppConfig
 from prompt import Session, build_prompt, checkpoint_boundary, relabel_token_ids
+from prompt_cache import PromptCacheStore
 
 MODEL_INFO = {
     "max_position_embeddings": 10_000,
@@ -103,6 +104,49 @@ def test_every_message_boundaries_report_accepts_and_rejects():
     accepted = [entry["position"] for entry in checkpoints if entry["ok"]]
     assert accepted == sorted(accepted)
     assert report["checkpoint_at"] == accepted[-1]
+
+
+def test_prompt_preview_keeps_cache_comparison_when_reuse_is_disabled():
+    session = Session(mode="messages", messages=[{"role": "user", "content": "hello"}])
+    tokenizer = FakeTokenizer()
+    compat_key = PromptCacheStore.compat_key(
+        model_path="fake-model", revision=None, adapter_path=None,
+        kv_bits=None, kv_group_size=64, quantized_kv_start=5000,
+    )
+    baseline = build_prompt(
+        session, AppConfig(max_tokens=10, context_budget=1000), tokenizer,
+        model_info=MODEL_INFO, capabilities={},
+    )
+    store = PromptCacheStore()
+    cached_ids = baseline["token_ids"][:-1]
+    store.insert(
+        cached_ids, [], "checkpoint", compat_key,
+        max_entries=8, max_bytes=10_000, after_message=1,
+    )
+
+    report = build_prompt(
+        session,
+        AppConfig(cache_reuse=False, max_tokens=10, context_budget=1000),
+        tokenizer,
+        model_info=MODEL_INFO,
+        capabilities={},
+        cache_store=store,
+        compat_key=compat_key,
+        include_pieces=True,
+    )
+
+    assert report["cache_prediction"]["potential_reused_tokens"] == len(cached_ids)
+    assert report["cache_prediction"]["reused_tokens"] == 0
+    assert report["cache_prediction"]["reason"] == (
+        "Cache reuse is OFF: all input tokens will be processed."
+    )
+    assert len(report["cache_entries"]) == 1
+    comparison = report["cache_entries"][0]
+    assert comparison["id"] == 1
+    assert comparison["tokens"] == len(cached_ids)
+    assert comparison["shared_prefix"] == len(cached_ids)
+    assert comparison["reusable_tokens"] == len(cached_ids)
+    assert comparison["token_window"]
 
 
 def test_last_message_only_checks_the_final_boundary():

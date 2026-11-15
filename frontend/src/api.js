@@ -98,6 +98,8 @@ export const EVENT_TYPES = [
   'cache.insert',
   'cache.evict',
   'cache.delete',
+  'cache.relabel',
+  'cache.restore',
   'cache.clear',
   'cache.verify',
   'runtime.wired_limit',

@@ -8,6 +8,7 @@ export default function ChatInput({
   modelLoaded,
   running,
   busy,
+  editing,
   onSend,
   onStop,
   onNewConversation,
@@ -35,11 +36,12 @@ export default function ChatInput({
         onChange={(event) => onDraftChange(event.target.value)}
         onKeyDown={handleKeyDown}
       />
+      {editing && <p className="note">Apply or discard the staged context edits before sending.</p>}
       <div className="button-row wrap">
         <button
           type="button"
           className="primary"
-          disabled={!modelLoaded || running || !draft.trim()}
+          disabled={!modelLoaded || busy || !draft.trim()}
           onClick={onSend}
         >
           Send
@@ -48,7 +50,7 @@ export default function ChatInput({
         <span className="muted small">Enter to send · Shift+Enter for a new line</span>
         <span className="spacer" />
         <span className="muted small">{turns} {turns === 1 ? 'turn' : 'turns'}</span>
-        <button type="button" disabled={running} onClick={onNewConversation}>New conversation</button>
+        <button type="button" disabled={busy} onClick={onNewConversation}>New conversation</button>
       </div>
     </div>
   )

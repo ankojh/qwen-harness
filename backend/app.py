@@ -535,7 +535,15 @@ def _read_cache_entry(entry: Any, tokenizer: Any, layer_types: list[str] | None)
 @api.get("/cache/tokens")
 async def cache_tokens(request: Request):
     """Token ids per entry; plain ints under the store lock, safe on the loop."""
-    return {"entries": _ctx(request).cache.token_lists()}
+    ctx = _ctx(request)
+    entries = ctx.cache.token_lists()
+    # Token labels are ordinary CPU data. Keep the current cache readable even
+    # before a request exists, without inspecting or copying MLX layer state.
+    if ctx.loaded is not None:
+        for entry in entries:
+            entry["text_excerpt"] = ctx.loaded.tokenizer.decode(entry["token_ids"][:128])
+            entry["excerpt_truncated"] = len(entry["token_ids"]) > 128
+    return {"entries": entries}
 
 
 @api.get("/cache/entries/{entry_id}")

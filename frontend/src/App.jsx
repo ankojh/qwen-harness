@@ -45,15 +45,19 @@ function newRequestId() {
 }
 
 // Turns 1..N (their recorded snapshots) plus Next (the request being typed).
-function TurnSelector({ turns, viewTurnId, onSelect }) {
-  if (turns.length === 0) return null
+function TurnSelector({ turns, viewTurnId, onSelect, editing }) {
   return (
-    <div className="turn-selector">
-      <span className="muted">Viewing</span>
+    <div className="history-bar">
+      <button type="button" className={viewTurnId === null ? 'active' : ''} disabled={editing} onClick={() => onSelect(null)}>Current state</button>
+      {viewTurnId !== null && <strong className="historical-label">Historical snapshot · read-only</strong>}
+      <details><summary>History & changes ({turns.length} turns)</summary>
+      <div className="turn-selector">
+      <span className="muted">Recorded requests</span>
       {turns.map((turn) => (
         <button
           key={turn.id}
           type="button"
+          disabled={editing}
           className={viewTurnId === turn.id ? 'active' : ''}
           onClick={() => onSelect(viewTurnId === turn.id ? null : turn.id)}
         >
@@ -63,10 +67,13 @@ function TurnSelector({ turns, viewTurnId, onSelect }) {
       <button
         type="button"
         className={viewTurnId === null ? 'active' : ''}
+        disabled={editing}
         onClick={() => onSelect(null)}
       >
-        Next
+        Return to current
       </button>
+      {turns.length === 0 && <span className="muted">Send a message to record a turn.</span>}
+      </div></details>
     </div>
   )
 }
@@ -79,6 +86,7 @@ export default function App() {
     raw_text: '',
   })
   const [draft, setDraft] = useState('')
+  const [editing, setEditing] = useState(false)
   const [lastInput, setLastInput] = useState('')
   const [turns, setTurns] = useState([])
   const [detailsTab, setDetailsTab] = useState(null)
@@ -107,6 +115,12 @@ export default function App() {
     setPendingEdits(pendingEditsRef.current)
   }, [])
 
+  const refreshState = useCallback(async () => {
+    const data = await getState()
+    setState(data)
+    return data
+  }, [])
+
   // A cache action (delete, relabel, restore, save checkpoint) with its
   // edit-log line: run it, log it, refresh state, surface errors.  ``line``
   // may be a function of the result (for labels that need the entry id).
@@ -116,7 +130,7 @@ export default function App() {
       try {
         const result = await action()
         logEdit(typeof line === 'function' ? line(result) : line)
-        refreshState().catch(() => {})
+        await refreshState()
         return result
       } catch (error) {
         if (!options.silent) setActionError(formatError(error.detail || error))
@@ -131,16 +145,12 @@ export default function App() {
   const applyStagedSession = useCallback(
     (nextSession, lines) => {
       setSession(nextSession)
+      setPreview(null)
+      setViewTurnId(null)
       lines.forEach(logEdit)
     },
     [logEdit],
   )
-
-  const refreshState = useCallback(async () => {
-    const data = await getState()
-    setState(data)
-    return data
-  }, [])
 
   const refreshGeneration = useCallback(async (id) => {
     const record = await getGeneration(id)
@@ -248,6 +258,11 @@ export default function App() {
           type === 'model.error' ||
           type === 'cache.clear' ||
           type === 'cache.delete' ||
+          type === 'cache.relabel' ||
+          type === 'cache.restore' ||
+          type === 'cache.insert' ||
+          type === 'cache.checkpoint' ||
+          type === 'config.changed' ||
           type === 'cache.evict'
         ) {
           refreshState().catch(() => {})
@@ -279,7 +294,13 @@ export default function App() {
   // Auto-refresh calls the tokenizer only, never the model.  It also reruns
   // when the cache changes, so the reuse prediction stays current.
   useEffect(() => {
-    if (!autoPreview || !state?.model_loaded) return undefined
+    if (activeGenId) return undefined
+    if (!autoPreview || !state?.model_loaded) {
+      setPreview(null)
+      return undefined
+    }
+    setPreview(null)
+    setPreviewError(null)
     if (!hasContext) {
       setPreview(null)
       setPreviewError(null)
@@ -301,7 +322,7 @@ export default function App() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [autoPreview, nextSession, hasContext, state?.model_loaded, state?.config, state?.cache?.accounted_bytes, state?.cache?.entries_count])
+  }, [autoPreview, nextSession, hasContext, state?.model_loaded, state?.config, state?.cache, activeGenId])
 
   // When a run started by Send finishes, its answer joins the conversation
   // (without the thinking, which the chat template would drop anyway) and the
@@ -333,6 +354,8 @@ export default function App() {
         generated,
         thinking: (generation.tokens || []).filter((token) => token.channel === 'thinking').length,
         context: generation.prompt,
+        prefill: generation.stats?.prefill || null,
+        finish: generation.finish,
         cache: null,
         edits,
       },
@@ -345,7 +368,7 @@ export default function App() {
         const snapshot = {
           entries,
           total_bytes: freshState.cache?.total_bytes ?? 0,
-          last_lookup: freshState.cache?.last_lookup ?? null,
+          last_lookup: generation.cache_lookup ?? freshState.cache?.last_lookup ?? null,
         }
         setTurns((previous) =>
           previous.map((turn) => (turn.id === generation.id ? { ...turn, cache: snapshot } : turn)),
@@ -438,6 +461,7 @@ export default function App() {
 
   async function handleSend() {
     const text = draft.trim()
+    if (editing) { setActionError('Apply or discard the staged context edits before sending.'); return }
     if (!text || activeGenId || !state?.model_loaded) return
     const previous = session
     const next = {
@@ -445,7 +469,9 @@ export default function App() {
       mode: 'messages',
       messages: [...session.messages, { ...EMPTY_MESSAGE, content: text }],
     }
+    setViewTurnId(null)
     setSession(next)
+    setPreview(null)
     setDraft('')
     setLastInput(text)
     setActionError(null)
@@ -466,6 +492,8 @@ export default function App() {
 
   function handleNewConversation() {
     pendingTurnRef.current = null
+    pendingEditsRef.current = []
+    setPendingEdits([])
     setSession((previous) => ({ ...previous, mode: 'messages', messages: [], raw_text: '' }))
     setTurns([])
     setViewTurnId(null)
@@ -516,7 +544,7 @@ export default function App() {
       <div className="boot">
         <strong>Qwen Harness</strong>
         <span className="muted">connecting to the local backend…</span>
-        {actionError && <span className="note note-error">{actionError}</span>}
+        {actionError && <><span className="note note-error">{actionError}</span><button type="button" onClick={() => refreshState().catch((error) => setActionError(error.message))}>Retry connection</button></>}
       </div>
     )
   }
@@ -534,13 +562,13 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <strong>Qwen Harness</strong>
-          <span className="muted">{state.config?.model_path}</span>
+          <span className="muted">Context & cache lab · {window.location.port || 'local'}</span>
         </div>
         <div className="topbar-meta">
           <span className={`pill ${modelLoaded ? 'pill-ok' : 'pill-off'}`}>
             {modelLoaded ? 'model loaded' : 'model idle'}
           </span>
-          <span>{running ? 'generating' : 'idle'}</span>
+          <span>{sseState !== 'connected' ? 'reconnecting · live state may be stale' : running ? 'generating' : 'idle'}</span>
           <button
             type="button"
             className="menu-button"
@@ -562,7 +590,7 @@ export default function App() {
 
       <div className="main">
         <PanelGroup direction="horizontal" style={{ height: '100%' }}>
-          <Panel defaultSize={50} minSize={25}>
+          <Panel defaultSize={34} minSize={25}>
             <PanelGroup direction="vertical" style={{ height: '100%' }}>
               <Panel defaultSize={28} minSize={15}>
                 <div className="panel-scroll">
@@ -573,7 +601,8 @@ export default function App() {
                     turns={turns.length}
                     modelLoaded={modelLoaded}
                     running={running}
-                    busy={busy}
+                    busy={busy || editing}
+                    editing={editing}
                     onSend={handleSend}
                     onStop={handleStop}
                     onNewConversation={handleNewConversation}
@@ -593,13 +622,13 @@ export default function App() {
 
           <PanelResizeHandle className="resize vertical" />
 
-          <Panel defaultSize={50} minSize={25}>
+          <Panel defaultSize={66} minSize={35}>
             <div className="right-column">
-              <TurnSelector turns={turns} viewTurnId={viewTurnId} onSelect={setViewTurnId} />
+              <TurnSelector turns={turns} viewTurnId={viewTurnId} onSelect={setViewTurnId} editing={editing} />
               <PanelGroup direction="vertical" style={{ flex: 1, minHeight: 0 }}>
-                <Panel defaultSize={55} minSize={15}>
+                <Panel defaultSize={44} minSize={15}>
                   <div className="panel-scroll">
-                    <div className="panel-title">Context <span className="title-note">lives in this browser tab, sent in full every request</span></div>
+                    <div className="panel-title">Context {viewTurn ? `at turn ${viewTurn.n}` : 'now'} <span className="title-note">message text in this tab → full token sequence sent</span></div>
                     <ContextPanel
                       preview={preview}
                       previewError={previewError}
@@ -612,18 +641,23 @@ export default function App() {
                       prevTurn={prevTurn}
                       pendingEdits={pendingEdits}
                       systemPrompt={state.config?.system_prompt || ''}
+                      cacheState={state.cache}
+                      config={state.config}
+                      onEditingChange={setEditing}
                       onApplyStaged={applyStagedSession}
                       onCacheAction={runCacheAction}
                     />
                   </div>
                 </Panel>
                 <PanelResizeHandle className="resize horizontal" />
-                <Panel defaultSize={45} minSize={15}>
+                <Panel defaultSize={56} minSize={15}>
                   <div className="panel-scroll">
-                    <div className="panel-title">Cache <span className="title-note">lives on the server, reused on an exact prefix match</span></div>
+                    <div className="panel-title">Cache {viewTurn ? `after turn ${viewTurn.n}` : 'now'} <span className="title-note">computed model state saved on the server</span></div>
                     <CachePanel
                       state={state}
-                      preview={preview}
+                      preview={running ? generation?.prompt || preview : preview}
+                      previewError={previewError}
+                      running={running}
                       generation={generation}
                       busy={busy}
                       onClearCache={handleClearCache}

@@ -687,12 +687,38 @@ def build_prompt(
             spans = _token_spans(token_ids, tokenizer, submitted)
 
     cache_prediction = None
+    cache_entries = []
     checkpoint_estimate = None
     checkpoint_estimate_reason: str | None = None
     if cache_store is None or compat_key is None:
         checkpoint_estimate_reason = "no prompt cache is available"
     else:
         cache_prediction = cache_store.peek(token_ids, compat_key)
+        if include_pieces:
+            for comparison in cache_store.compare(token_ids, compat_key):
+                ids = comparison.pop("token_ids")
+                boundary = comparison["shared_prefix"]
+                start = max(0, boundary - 5)
+                end = min(len(ids), boundary + 8)
+                comparison["tokens"] = len(ids)
+                try:
+                    comparison["text_excerpt"] = tokenizer.decode(ids[:128])
+                except Exception:  # best-effort display for unusual tokenizers
+                    comparison["text_excerpt"] = "".join(_token_text(tokenizer, i, tokenizer.convert_ids_to_tokens(i)) for i in ids[:128])
+                comparison["excerpt_truncated"] = len(ids) > 128
+                comparison["window_start"] = start
+                comparison["window_end"] = end
+                comparison["token_window"] = [
+                    {"position": i, "id": ids[i], "piece": tokenizer.convert_ids_to_tokens(ids[i]),
+                     "text": _token_text(tokenizer, ids[i], tokenizer.convert_ids_to_tokens(ids[i])),
+                     "special": _token_is_special(tokenizer, ids[i])}
+                    for i in range(start, end)
+                ]
+                cache_entries.append(comparison)
+        if not config.cache_reuse:
+            cache_prediction = {**cache_prediction,
+                                "potential_reused_tokens": cache_prediction["reused_tokens"],
+                                "reused_tokens": 0, "reason": "Cache reuse is OFF: all input tokens will be processed."}
         planned = [
             entry["position"]
             for entry in checkpoints
@@ -732,6 +758,7 @@ def build_prompt(
         "starts_in_thinking": starts_in_thinking,
         "prompt_hash": _hash_tokens(token_ids),
         "cache_prediction": cache_prediction,
+        "cache_entries": cache_entries,
         "template": template_report,
     }
     return report

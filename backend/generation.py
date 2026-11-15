@@ -492,6 +492,9 @@ def run_generation(
                 "reason": "cache_reuse is off",
             }
             cache_store.note_lookup(lookup)
+        # Keep the actual lookup with its request; later checkpoint operations
+        # also update the cache store's global last_lookup.
+        generations.update(gen_id, cache_lookup=dict(lookup))
         emit(
             "cache.lookup",
             {

@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { formatBytes } from './ConfigPanel.jsx'
+import CacheMatch, { ReuseExplainer } from './CacheMatch.jsx'
 import TokenChips, { chipText } from './TokenChips.jsx'
 import { commonPrefix, diffCaches } from './turnDiffs.js'
-import { deleteCacheEntry, getCacheEntry, relabelEntry, restoreEntry } from './api.js'
+import { deleteCacheEntry, getCacheEntry, getCacheTokens, relabelEntry, restoreEntry } from './api.js'
 
 // The server-side prompt cache.  Three views: Overview (the summary as
 // before plus the quick switches; clicking an entry opens it), Inside an
@@ -32,9 +33,9 @@ function CacheTabs({ view, onChange }) {
   return (
     <div className="tabs" role="tablist">
       {[
-        ['overview', 'Overview'],
-        ['inside', 'Inside an entry'],
-        ['changes', 'Changes'],
+        ['overview', 'Current'],
+        ['inside', 'Entry tools'],
+        ['changes', 'History diff'],
       ].map(([id, label]) => (
         <button
           key={id}
@@ -103,8 +104,8 @@ function RelabelForm({ position, text, setText, error, busy, onSubmit, onCancel 
       </button>
       {error && <span className="note note-error">{error}</span>}
       <span className="muted small">
-        The entry will claim the new token while the stored state stays as it
-        was. One token only; the count never changes.
+        This changes token labels only. The computed model state stays as it was.
+        One token only; the count never changes. States later built from this entry may carry the effect even after Restore.
       </span>
     </div>
   )
@@ -314,7 +315,7 @@ function ChangesView({ currentCache, previousCache, contextIds, lookup, editLog,
             const diff = diffCaches(previousCache, currentCache, contextIds)
             const signed = (bytes) => `${bytes >= 0 ? '+' : ''}${formatBytes(bytes)}`
             const entryLabel = (entry) =>
-              `#${entry.id} ${KIND_LABEL[entry.kind] || entry.kind}${entry.after_message ? ` after message ${entry.after_message}` : ''} · ${(entry.token_ids || []).length} tokens`
+              `${KIND_LABEL[entry.kind] || entry.kind}${entry.after_message ? ` after message ${entry.after_message}` : ''} · ${(entry.token_ids || []).length} tokens`
             return (
               <>
                 <div className="change-row">
@@ -328,7 +329,7 @@ function ChangesView({ currentCache, previousCache, contextIds, lookup, editLog,
                   )}
                 </div>
                 <div className="change-row">
-                  <strong>Evicted</strong>
+                  <strong>Removed since snapshot</strong>
                   {diff.evicted.length === 0 ? (
                     <div className="muted">none</div>
                   ) : (
@@ -365,6 +366,10 @@ function ChangesView({ currentCache, previousCache, contextIds, lookup, editLog,
                   )}
                 </div>
                 <div className="change-row">
+                  <strong>Changed token labels</strong>
+                  {diff.modified.length === 0 ? <div className="muted">none</div> : diff.modified.map(({ entry, changes }) => <div key={entry.id}><b>#{entry.id}</b>{changes.map((c) => <div key={c.position}>position {c.position}: <del>ID {c.before ?? 'absent'}</del> → <ins>ID {c.after ?? 'absent'}</ins></div>)}</div>)}
+                </div>
+                <div className="change-row">
                   <strong>Memory</strong>
                   <div>
                     {formatBytes(previousCache.total_bytes ?? 0)} → {formatBytes(currentCache.total_bytes ?? 0)} ·{' '}
@@ -383,6 +388,8 @@ function ChangesView({ currentCache, previousCache, contextIds, lookup, editLog,
 export default function CachePanel({
   state,
   preview,
+  previewError,
+  running,
   generation,
   busy,
   onClearCache,
@@ -393,6 +400,8 @@ export default function CachePanel({
   onCacheAction,
 }) {
   const [view, setView] = useState('overview')
+  const [liveTokenEntries, setLiveTokenEntries] = useState(null)
+  const [tokenError, setTokenError] = useState(null)
   const [insideId, setInsideId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [detailError, setDetailError] = useState(null)
@@ -407,7 +416,7 @@ export default function CachePanel({
   const liveEntries = state.cache?.entries || []
   const entries = historical ? viewTurn.cache?.entries || [] : liveEntries
   const currentCache = {
-    entries,
+    entries: historical ? entries : (liveTokenEntries || []).map((entry) => ({ ...liveEntries.find((e) => e.id === entry.id), ...entry })),
     total_bytes: historical ? viewTurn.cache?.total_bytes ?? 0 : state.cache?.total_bytes ?? 0,
   }
   const contextIds = historical ? viewTurn.context?.token_ids || [] : preview?.token_ids || []
@@ -415,8 +424,13 @@ export default function CachePanel({
     ? viewTurn.context?.token_pieces || []
     : preview?.token_pieces || []
   const prediction = preview?.cache_prediction
-  const lastLookup = historical ? viewTurn.cache?.last_lookup : state.cache?.last_lookup
-  const lastPrefill = generation?.stats?.prefill
+  const lastLookup = historical ? viewTurn.cache?.last_lookup : generation?.cache_lookup || state.cache?.last_lookup
+  const actualRequest = historical || Boolean(generation?.cache_lookup)
+  const lastPrefill = historical ? viewTurn.prefill : generation?.cache_lookup ? generation?.stats?.prefill : null
+  const lastInputTokens = historical ? viewTurn.context?.token_ids?.length : generation?.prompt?.token_ids?.length
+  const lastReused = lastLookup?.reused_tokens || 0
+  const finalInputProcessed = lastPrefill && lastInputTokens != null && lastPrefill.processed_tokens + lastReused < lastInputTokens && (historical ? viewTurn.finish?.phase !== 'prefill' : generation?.finish?.phase !== 'prefill') ? 1 : 0
+  const processedInput = lastPrefill ? lastPrefill.processed_tokens + finalInputProcessed : null
   const longest = Math.max(...entries.map((entry) => entry.tokens || 0), 1)
   const planned = (preview?.checkpoints || []).filter(
     (entry) => entry.ok && entry.position > (prediction?.reused_tokens || 0),
@@ -427,9 +441,19 @@ export default function CachePanel({
   const previousCache = prevTurn?.cache || null
   const editLog = historical ? viewTurn.edits || [] : pendingEdits || []
 
+  useEffect(() => {
+    if (historical || running) return undefined
+    let cancelled = false
+    setLiveTokenEntries(null)
+    setTokenError(null)
+    getCacheTokens().then((data) => { if (!cancelled) setLiveTokenEntries(data.entries || []) })
+      .catch((error) => { if (!cancelled) setTokenError(error.message) })
+    return () => { cancelled = true }
+  }, [historical, view, state.cache, running])
+
   // Inside view: fetch the entry details on demand (and after every edit).
   useEffect(() => {
-    if (view !== 'inside' || insideId == null) {
+    if (view !== 'inside' || insideId == null || historical || running) {
       setDetail(null)
       setDetailError(null)
       return undefined
@@ -451,7 +475,7 @@ export default function CachePanel({
     return () => {
       cancelled = true
     }
-  }, [view, insideId, detailVersion])
+  }, [view, insideId, detailVersion, historical, running, state.cache])
 
   function openEntry(id) {
     setInsideId(id)
@@ -549,7 +573,7 @@ export default function CachePanel({
       <CacheTabs view={view} onChange={(next) => setView(next)} />
 
       {view === 'inside' && (
-        detailError ? (
+        historical ? <p className="note">Historical snapshots preserve entry token IDs and summaries, not editable model state or layer arrays. Return to Current state to inspect a live entry.</p> : running ? <p className="note">Entry tools wait until generation finishes. The cache may be changing.</p> : insideId == null ? <p className="muted">Select an entry in Current to inspect, delete or relabel its tokens.</p> : detailError ? (
           <p className="note note-error">
             {String(detailError)} — the entry may have been evicted.
           </p>
@@ -581,7 +605,7 @@ export default function CachePanel({
       )}
 
       {view === 'changes' && (
-        <ChangesView
+        tokenError && !historical ? <p className="note note-error">{tokenError}</p> : !historical && !liveTokenEntries ? <p className="muted">Reading current cache labels…</p> : <ChangesView
           currentCache={currentCache}
           previousCache={previousCache}
           contextIds={contextIds}
@@ -593,45 +617,10 @@ export default function CachePanel({
 
       {view === 'overview' && (
         <>
-          <div className="cache-calls">
-            {historical ? (
-              <div className={`note ${lastLookup?.reused_tokens ? 'note-ok' : 'note-warn'}`}>
-                <strong>This request: </strong>
-                {lastLookup?.reused_tokens
-                  ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}${lastLookup.relabeled ? ' (a tampered entry)' : ''}`
-                  : 'reused nothing'}
-                <div className="small">{lastLookup?.reason || 'no lookup recorded'}</div>
-              </div>
-            ) : (
-              <>
-                <div className={`note ${prediction?.reused_tokens ? 'note-ok' : ''}`}>
-                  <strong>Next request: </strong>
-                  {!preview
-                    ? 'type a message to see a prediction'
-                    : prediction?.reused_tokens
-                      ? `reuses ${prediction.reused_tokens} of ${preview.budget?.input_tokens} tokens from #${prediction.entry_id}${prediction.relabeled ? ' (a tampered entry)' : ''}`
-                      : `nothing reusable (${prediction?.reason || 'no prediction'})`}
-                  {preview && (
-                    <div className="small">
-                      will save: {planned.length > 0 ? `a checkpoint at token ${planned.map((entry) => entry.position).join(', ')} and ` : ''}
-                      the full exchange after the reply
-                    </div>
-                  )}
-                </div>
-                {lastLookup && (
-                  <div className={`note ${lastLookup.reused_tokens ? 'note-ok' : 'note-warn'}`}>
-                    <strong>Last request: </strong>
-                    {lastLookup.reused_tokens
-                      ? `reused ${lastLookup.reused_tokens} tokens from #${lastLookup.entry_id}${lastLookup.relabeled ? ' (a tampered entry)' : ''}`
-                      : 'reused nothing'}
-                    {lastPrefill ? `, read ${lastPrefill.processed_tokens} in ${lastPrefill.seconds}s` : ''}
-                    <div className="small">{lastLookup.reason}</div>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-
+          {!historical && <ReuseExplainer />}
+          <div className="cache-current-layout"><div className="saved-states">
+          <h4>{historical ? 'Saved entries after this turn' : 'All saved states now'}</h4>
+          {tokenError && <p className="note note-error">Cannot read current cache labels: {tokenError}</p>}
           {entries.length === 0 ? (
             <p className="muted">
               Empty. Each reply stores the conversation so far so a later request can
@@ -644,6 +633,8 @@ export default function CachePanel({
                 const next = !historical && prediction?.reused_tokens > 0 && prediction.entry_id === entry.id
                 const last = !historical && lastLookup?.reused_tokens > 0 && lastLookup.entry_id === entry.id
                 const tampered = (entry.relabels || 0) > 0
+                const match = !historical ? preview?.cache_entries?.find((e) => e.id === entry.id) : null
+                const labels = match || (historical ? entry : liveTokenEntries?.find((e) => e.id === entry.id))
                 return (
                   <li key={entry.id} className={`cache-entry ${next ? 'is-next' : ''}`}>
                     <div className="cache-entry-row">
@@ -663,6 +654,11 @@ export default function CachePanel({
                             {last && <span className="badge">used last</span>}
                           </span>
                         </span>
+                        {match && <>
+                          <span className={`entry-match-label ${match.reusable_tokens ? 'reusable' : ''}`}>{match.shared_prefix} leading labels match · {match.reusable_tokens} tokens usable{state.config?.cache_reuse === false ? ' · reuse disabled' : ''}</span>
+                          <span className="small">{match.reason}</span>
+                        </>}
+                        {labels?.text_excerpt && <span className="cache-excerpt">{labels.text_excerpt}{labels.excerpt_truncated ? '…' : ''}</span>}
                         <span className="entry-bar">
                           <span style={{ width: `${((entry.tokens || 0) / longest) * 100}%` }} />
                         </span>
@@ -674,6 +670,7 @@ export default function CachePanel({
                         type="button"
                         className="mini danger cache-entry-delete"
                         disabled={busy || historical}
+                        aria-label={`Delete cache entry ${entry.id}`}
                         title={historical ? 'snapshots of past turns are read-only' : 'delete this entry'}
                         onClick={() => handleDelete(entry)}
                       >
@@ -688,12 +685,18 @@ export default function CachePanel({
 
           <div className="row-between">
             <span className="muted small">
-              A request reuses an entry only if it starts with exactly that entry's tokens.
+              Open an entry for exact tokens, memory layers, and relabel/restore tools.
             </span>
-            <button type="button" className="mini" disabled={busy || entries.length === 0} onClick={onClearCache}>
+            <button type="button" className="mini" disabled={busy || historical || entries.length === 0} onClick={onClearCache}>
               Clear cache
             </button>
           </div>
+          </div><div className="cache-current-comparison">
+          {!historical && <>
+            {running ? <p className="note" role="status">Generation in progress. Cache entries can change while the model works; the next-request comparison refreshes when it finishes.</p> : previewError ? <p className="note note-error">Cache comparison unavailable: {previewError}</p> : <CacheMatch report={preview} reuseEnabled={state.config?.cache_reuse !== false} running={running} />}
+          </>}
+          {lastLookup && <details className="last-request"><summary>{actualRequest ? 'Last actual request' : 'Most recent cache operation'} · reused {lastLookup.reused_tokens || 0} tokens{lastPrefill ? ` · processed ${processedInput} input tokens` : ''}</summary><p>{lastLookup.reason}</p>{lastPrefill && <p>Input processing before the final token: {lastPrefill.processed_tokens} tokens in {lastPrefill.seconds}s{finalInputProcessed ? '; one final input token is processed to start the answer' : ''}. This is a recorded result; the next-request comparison is a prediction.</p>}</details>}
+          </div></div>
         </>
       )}
     </div>

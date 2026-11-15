@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import TokenChips from './TokenChips.jsx'
-import { commonPrefix, diffContexts, messageOf, stopsMatching } from './turnDiffs.js'
+import { commonPrefix, diffContexts, lcsRanges, messageOf, stopsMatching } from './turnDiffs.js'
 import { formatError, getCacheTokens, previewPrompt, saveCheckpoint } from './api.js'
 
 // The context: what the viewed request sends, message by message.  Four
@@ -153,7 +153,7 @@ function TokensView({ report, spans, pieces, reused }) {
         else if (message?.role === 'system') totals.systemWords += words
         totals.template += template
         totals.tokens += size
-        const cachedStart = Math.max(0, Math.min(reused, span.end) - span.start)
+        const cachedStart = 0
         const cachedEnd = Math.min(size, Math.max(0, Math.min(reused, span.end) - span.start))
         return (
           <div key={key} className="tok-group">
@@ -286,6 +286,7 @@ function DiffRow({ row, report, prevReport }) {
               {label} {prevSize} → {nextSize}
             </span>
           </div>
+          {row.diff?.approximate && <p className="muted small">Large changed region: highlighting is approximate inside this region.</p>}
           <div className="chips-wrap">
             <span className="muted small">removed</span>
             <TokenChips
@@ -396,10 +397,20 @@ function ConsequencesCard({
   const changed = firstDiff < Math.max(nowIds.length, afterIds.length)
   const stops = stopsMatching(cacheTokens, nowIds, afterIds)
   const reuse = (tokens, entry) => (tokens > 0 ? `${tokens} (#${entry})` : '0')
+  const tokenDiff = lcsRanges(nowIds, afterIds)
+  const ready = Boolean(nowReport && stagedPreview && !stagedPreviewError)
+
   return (
     <div className="edit-consequences">
       <strong>If you apply these edits</strong>
       {stagedPreviewError && <p className="note note-error">{stagedPreviewError}</p>}
+      {!ready ? <p role="status">{stagedPreviewError ? 'Fix the preview error before applying.' : 'Measuring staged context and cache consequences…'}</p> : <>
+      <div className="staged-diff">
+        <strong>Context diff · current → staged (draft included on both sides)</strong>
+        <p className="muted small">{tokenDiff.approximate ? 'Large changed region: red and green mark the entire changed region, including any unchanged IDs inside it. Matching beginning and ending remain uncoloured.' : 'Red = removed token IDs. Green = added token IDs. Uncoloured tokens are unchanged.'}</p>
+        <div className="chips-wrap"><b>Before</b><TokenChips tokens={nowReport?.token_pieces || []} marks={tokenDiff.removed.map((r) => ({ ...r, kind: 'removed' }))} /></div>
+        <div className="chips-wrap"><b>After</b><TokenChips tokens={stagedPreview?.token_pieces || []} marks={tokenDiff.added.map((r) => ({ ...r, kind: 'added' }))} /></div>
+      </div>
       <div className="table-scroll">
         <table className="data-table">
           <thead>
@@ -448,8 +459,10 @@ function ConsequencesCard({
           </tbody>
         </table>
       </div>
+      <p className="muted small">Applying changes the context only. Saved cache states keep their original computation; incompatible entries remain stored but cannot be reused for the edited beginning.</p>
+      </>}
       <div className="chips-wrap">
-        <button type="button" className="primary" disabled={busy} onClick={onApply}>Apply</button>
+        <button type="button" className="primary" disabled={busy || !ready || stagedPreview?.ok === false} onClick={onApply}>Apply</button>
         <button type="button" disabled={busy} onClick={onDiscard}>Discard</button>
         {busy && <span className="muted small">wait for the generation to finish</span>}
       </div>
@@ -459,9 +472,12 @@ function ConsequencesCard({
 
 function EditView({
   session,
+  draft,
   staged,
   setStaged,
   preview,
+  cacheState,
+  config,
   systemPrompt,
   modelLoaded,
   busy,
@@ -469,14 +485,15 @@ function EditView({
   onCacheAction,
   onLeave,
 }) {
+  const [beforePreview, setBeforePreview] = useState(null)
   const [stagedPreview, setStagedPreview] = useState(null)
   const [stagedPreviewError, setStagedPreviewError] = useState(null)
   const [cacheTokens, setCacheTokens] = useState([])
   const [checkpointBusy, setCheckpointBusy] = useState(false)
 
   const stagedSession = useMemo(
-    () => (staged ? { mode: 'messages', messages: staged } : null),
-    [staged],
+    () => (staged ? { mode: 'messages', messages: draft.trim() ? [...staged, { role: 'user', content: draft.trim(), enabled: true, reasoning_content: null }] : staged } : null),
+    [staged, draft],
   )
 
   // Consequences card: preview the staged session (tokenizer only) and the
@@ -488,16 +505,22 @@ function EditView({
       setCacheTokens([])
       return undefined
     }
+    setBeforePreview(null)
+    setStagedPreview(null)
+    setStagedPreviewError(null)
     let cancelled = false
     const timer = setTimeout(async () => {
       try {
-        const [report, tokenLists] = await Promise.all([
+        const currentSession = { ...session, messages: draft.trim() ? [...session.messages, { role: 'user', content: draft.trim(), enabled: true, reasoning_content: null }] : session.messages }
+        const [report, before, tokenLists] = await Promise.all([
           previewPrompt(stagedSession),
+          previewPrompt(currentSession),
           getCacheTokens(),
         ])
         if (!cancelled) {
+          setBeforePreview(before)
           setStagedPreview(report)
-          setStagedPreviewError(null)
+          setStagedPreviewError(report.ok === false ? report.error || 'Invalid staged context' : null)
           setCacheTokens(tokenLists.entries || [])
         }
       } catch (error) {
@@ -508,7 +531,7 @@ function EditView({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [stagedSession, modelLoaded])
+  }, [stagedSession, modelLoaded, cacheState, config, session, draft])
 
   function update(index, patch) {
     setStaged(staged.map((message, position) =>
@@ -650,6 +673,7 @@ function EditView({
               <textarea
                 rows={2}
                 value={message.content}
+                aria-label={`Content for message ${index + 1}`}
                 disabled={busy}
                 placeholder="content"
                 onChange={(event) => update(index, { content: event.target.value })}
@@ -670,7 +694,7 @@ function EditView({
         <InsertRow position={staged.length} onInsert={insert} disabled={busy} />
       </ol>
       <ConsequencesCard
-        preview={preview}
+        preview={beforePreview}
         stagedSession={stagedSession}
         stagedPreview={stagedPreview}
         stagedPreviewError={stagedPreviewError}
@@ -695,8 +719,11 @@ export default function ContextPanel({
   prevTurn,
   pendingEdits,
   systemPrompt,
+  cacheState,
+  config,
   onApplyStaged,
   onCacheAction,
+  onEditingChange,
 }) {
   const [view, setView] = useState('overview')
   const [staged, setStaged] = useState(null)
@@ -706,7 +733,13 @@ export default function ContextPanel({
   const effectiveView = view === 'edit' && (historical || running) ? 'overview' : view
   const editLog = historical ? viewTurn.edits || [] : pendingEdits || []
 
+  useEffect(() => {
+    onEditingChange?.(effectiveView === 'edit')
+    return () => onEditingChange?.(false)
+  }, [effectiveView, onEditingChange])
+
   function enterEdit() {
+    if (view === 'edit' && staged) return
     setStaged(session.messages.map((message) => ({ ...message })))
     setView('edit')
   }
@@ -716,7 +749,30 @@ export default function ContextPanel({
     setView(nextView)
   }
 
-  if (!modelLoaded) return <p className="muted">Load the model to see the context.</p>
+  const tabs = (
+    <div className="tabs" role="tablist">
+      {[
+        ['overview', 'Current'],
+        ['tokens', 'Tokens'],
+        ['changes', 'History diff'],
+        ...(historical ? [] : [['edit', 'Edit context']]),
+      ].map(([id, label]) => (
+        <button
+          key={id}
+          type="button"
+          role="tab"
+          className={effectiveView === id ? 'active' : ''}
+          disabled={(id === 'edit' && running) || (effectiveView === 'edit' && id !== 'edit')}
+          title={id === 'edit' && running ? 'wait for the generation to finish' : undefined}
+          onClick={() => (id === 'edit' ? enterEdit() : setView(id))}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+
+  if (!modelLoaded) return <div>{tabs}<p className="muted">Load the model to measure context tokens. The conversation lives in this tab.</p></div>
   if (historical && !report) return <p className="muted">This turn recorded no context.</p>
 
   if (effectiveView === 'edit') {
@@ -730,17 +786,17 @@ export default function ContextPanel({
         </div>
         <div className="tabs" role="tablist">
           {[
-            ['overview', 'Overview'],
+            ['overview', 'Current'],
             ['tokens', 'Tokens'],
-            ['changes', 'Changes'],
-            ['edit', 'Edit'],
+            ['changes', 'History diff'],
+            ['edit', 'Edit context'],
           ].map(([id, label]) => (
             <button
               key={id}
               type="button"
               role="tab"
               className={effectiveView === id ? 'active' : ''}
-              disabled={id === 'edit' && running}
+              disabled={(id === 'edit' && running) || (effectiveView === 'edit' && id !== 'edit')}
               title={id === 'edit' && running ? 'wait for the generation to finish' : undefined}
               onClick={() => (id === 'edit' ? enterEdit() : setView(id))}
             >
@@ -750,9 +806,12 @@ export default function ContextPanel({
         </div>
         <EditView
           session={session}
+          draft={draft}
           staged={staged}
           setStaged={setStaged}
           preview={preview}
+          cacheState={cacheState}
+          config={config}
           systemPrompt={systemPrompt}
           modelLoaded={modelLoaded}
           busy={running}
@@ -764,16 +823,15 @@ export default function ContextPanel({
     )
   }
 
-  if (!historical && session.messages.length === 0 && !draft.trim()) {
-    return (
-      <p className="muted">
-        Empty. The conversation lives in this browser tab and is sent in full with every
-        request; start typing to see what the first request will contain.
-      </p>
-    )
+  if (!report) {
+    return <div className="context-panel">{tabs}
+      {previewError ? <p className="note note-error">{previewError}</p> : <p className="muted" role="status">{session.messages.length || draft.trim() ? running ? 'Generation in progress · current messages below; measurements update when it finishes.' : 'Measuring current context…' : 'No messages yet. Type in Input or use Edit context to add one.'}</p>}
+      <ol className="ctx-messages">{session.messages.map((message, index) => <li className="ctx-msg" key={index}><b>{message.role}{message.enabled === false ? ' · disabled' : ''}</b><span className="ctx-text full-text">{message.content || '(empty)'}</span></li>)}
+      {draft.trim() && <li className="ctx-msg"><b>user · draft</b><span className="ctx-text full-text">{draft.trim()}</span></li>}</ol>
+      <p className="muted small">Context is message text, not saved model state. The full rendered token sequence is sent each request. Reloading this tab clears the conversation; server cache entries remain.</p>
+    </div>
   }
-  if (previewError && !historical) return <p className="note note-error">{previewError}</p>
-  if (!report) return <p className="muted">Measuring…</p>
+  if (previewError && !historical) return <div>{tabs}<p className="note note-error">{previewError}</p></div>
 
   const pieces = report.token_pieces || []
   const spans = report.spans || []
@@ -782,37 +840,14 @@ export default function ContextPanel({
   const reused = historical
     ? viewTurn.reused || 0
     : report.cache_prediction?.reused_tokens || 0
-  const draftIndex = !historical && draft.trim() ? session.messages.length + 1 : null
+  const draftIndex = !historical && draft.trim() ? (report.submitted_messages || []).findLast((message) => message.role === 'user' && message.source === 'session')?.index : null
   const assistantTurns = []
   ;(report.submitted_messages || []).forEach((message) => {
     if (message.role === 'assistant') assistantTurns.push(message.index)
   })
   const removed = (report.transformations || []).join(' ')
   const pct = (value) => `${(value / (budget.context_budget || 1)) * 100}%`
-  const subject = historical ? `turn ${viewTurn.n}'s request` : 'the next request'
-
-  const tabs = (
-    <div className="tabs" role="tablist">
-      {[
-        ['overview', 'Overview'],
-        ['tokens', 'Tokens'],
-        ['changes', 'Changes'],
-        ...(historical ? [] : [['edit', 'Edit']]),
-      ].map(([id, label]) => (
-        <button
-          key={id}
-          type="button"
-          role="tab"
-          className={effectiveView === id ? 'active' : ''}
-          disabled={id === 'edit' && running}
-          title={id === 'edit' && running ? 'wait for the generation to finish' : undefined}
-          onClick={() => (id === 'edit' ? enterEdit() : setView(id))}
-        >
-          {label}
-        </button>
-      ))}
-    </div>
-  )
+  const subject = historical ? `turn ${viewTurn.n}'s request` : 'current context (next request)'
 
   if (effectiveView === 'tokens') {
     return (
@@ -862,6 +897,8 @@ export default function ContextPanel({
 
       {tabs}
 
+      <p className="context-explanation">These are the messages the model will read{draftIndex ? ', including your unsent draft' : ''}. <strong>{reused} tokens of input computation can be restored from cache; {total - reused} still need processing.</strong> Matching words later in the context do not count as reuse.</p>
+      {report.ok === false && <p className="note note-error">{report.error}</p>}
       <div className="budget-bar" title="Context budget">
         <div className="seg input" style={{ width: pct(total) }} />
         <div className="seg reservation" style={{ width: pct(budget.output_reservation || 0) }} />
@@ -901,7 +938,7 @@ export default function ContextPanel({
               <li key={key} className="ctx-msg">
                 <span className={`role-chip role-${message.role}`}>{message.role}</span>
                 <span className="ctx-text">
-                  {oneLine(message.content) || <span className="muted">(empty)</span>}
+                  <span className="full-text">{message.content || <span className="muted">(empty)</span>}</span>
                   <span className="ctx-tags">
                     {message.index === draftIndex && <span className="badge badge-warn">draft</span>}
                     {message.source && message.source !== 'session' && (
@@ -933,8 +970,9 @@ export default function ContextPanel({
         </p>
       )}
 
-      <TurnHistory turns={turns} />
+      <details><summary>Growth by turn · history</summary><TurnHistory turns={turns} /></details>
 
+      <details><summary>Exact tokens · green marks reused computation</summary><TokensView report={report} spans={spans} pieces={pieces} reused={reused} /></details>
       <details>
         <summary>Exact prompt text</summary>
         <pre className="code-block">{report.text}</pre>

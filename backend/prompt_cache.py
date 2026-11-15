@@ -236,6 +236,44 @@ class PromptCacheStore:
             index += 1
         return index
 
+    @staticmethod
+    def _assess(entry: CacheEntry, tokens: list[int], compat_key: tuple) -> dict[str, Any]:
+        """Explain exactly the same per-entry eligibility used by lookup."""
+        compatible = entry.compat_key == compat_key
+        common = PromptCacheStore._common_prefix(entry.tokens, tokens)
+        trimmable = can_trim_prompt_cache(entry.cache)
+        reuse = min(common, max(len(tokens) - 1, 0))
+        if not compatible:
+            reuse, reason = 0, "Different model or cache settings."
+        elif not tokens:
+            reuse, reason = 0, "No request to compare yet."
+        elif len(tokens) == 1:
+            reuse, reason = 0, "The only input token must still be processed."
+        elif common == 0:
+            reuse, reason = 0, "Different token IDs at position 0."
+        elif reuse < len(entry.tokens) and not trimmable:
+            reuse = 0
+            if common >= len(tokens):
+                reason = ("This state reaches or passes the request's end. At least one input "
+                          "token must be processed, and this state cannot rewind.")
+            else:
+                reason = (f"First different token at position {common}. This saved state "
+                          "continues past it and cannot rewind; a shorter checkpoint may work.")
+        elif reuse:
+            reason = (f"Can restore computed state for positions 0–{reuse - 1}; "
+                      f"process the remaining {len(tokens) - reuse} input tokens.")
+        else:
+            reason = "No usable saved prefix."
+        return {"shared_prefix": common, "reusable_tokens": reuse,
+                "compatible": compatible, "trimmable": trimmable, "reason": reason}
+
+    @_locked
+    def compare(self, tokens: list[int], compat_key: tuple) -> list[dict[str, Any]]:
+        """Read-only match explanations, without touching LRU or MLX arrays."""
+        return [{"id": entry.id, "kind": entry.kind, "after_message": entry.after_message,
+                 "token_ids": list(entry.tokens), "relabels": len(entry.relabels),
+                 **self._assess(entry, tokens, compat_key)} for entry in self._entries]
+
     @_locked
     def _find(self, tokens: list[int], compat_key: tuple) -> dict[str, Any]:
         """Pick the best *usable* entry.
@@ -262,11 +300,8 @@ class PromptCacheStore:
             ):
                 closest, closest_common = entry, common
 
-            reuse = min(common, limit)
+            reuse = self._assess(entry, tokens, compat_key)["reusable_tokens"]
             if reuse <= 0:
-                continue
-            if reuse < len(entry.tokens) and not can_trim_prompt_cache(entry.cache):
-                # This entry diverges before its end and cannot be shortened.
                 continue
             if (
                 best is None
@@ -294,6 +329,9 @@ class PromptCacheStore:
 
         if limit == 0:
             reason = "the prompt has only one token and it must be fed to the model"
+        elif closest_common >= len(tokens):
+            reason = ("at least one input token must be processed, but the closest "
+                      f"entry #{closest.id} reaches or passes the request's end and is not trimmable (cannot rewind)")
         elif closest_common <= 0:
             reason = (
                 f"closest entry #{closest.id} diverges at token 0 and the cache "
@@ -628,7 +666,7 @@ class PromptCacheStore:
                     }
                 )
             entry.tokens[position] = new_id
-            return {
+            info = {
                 "entry_id": entry.id,
                 "kind": entry.kind,
                 "position": position,
@@ -636,6 +674,8 @@ class PromptCacheStore:
                 "new_id": new_id,
                 "relabels": len(entry.relabels),
             }
+            self._emit("cache.relabel", info)
+            return info
         return None
 
     @_locked
@@ -648,12 +688,14 @@ class PromptCacheStore:
                 entry.tokens[item["position"]] = item["original_id"]
             count = len(entry.relabels)
             entry.relabels = []
-            return {
+            info = {
                 "entry_id": entry.id,
                 "kind": entry.kind,
                 "restored": count,
                 "relabels": 0,
             }
+            self._emit("cache.restore", info)
+            return info
         return None
 
     @_locked

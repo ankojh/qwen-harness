@@ -28,18 +28,27 @@ function rangesOf(flags) {
 // (next).  A simple LCS over the token ids; spans larger than ~2M cells are
 // marked fully changed instead of diffed.
 export function lcsRanges(prevIds, nextIds) {
-  const n = prevIds.length
-  const m = nextIds.length
-  if (n === 0) return { removed: [], added: rangesOf(nextIds.map(() => true)) }
-  if (m === 0) return { removed: rangesOf(prevIds.map(() => true)), added: [] }
+  // Trim equal edges first: identical/mostly unchanged long prompts should
+  // remain exact without allocating a quadratic table for the whole context.
+  const prefix = commonPrefix(prevIds, nextIds)
+  let suffix = 0
+  while (suffix < Math.min(prevIds.length, nextIds.length) - prefix &&
+         prevIds[prevIds.length - 1 - suffix] === nextIds[nextIds.length - 1 - suffix]) suffix += 1
+  const prev = prevIds.slice(prefix, prevIds.length - suffix)
+  const next = nextIds.slice(prefix, nextIds.length - suffix)
+  const n = prev.length
+  const m = next.length
+  const shift = (ranges) => ranges.map((r) => ({ start: r.start + prefix, end: r.end + prefix }))
+  if (n === 0) return { removed: [], added: shift(rangesOf(next.map(() => true))), approximate: false }
+  if (m === 0) return { removed: shift(rangesOf(prev.map(() => true))), added: [], approximate: false }
   if (n * m > 2_000_000) {
-    return { removed: rangesOf(prevIds.map(() => true)), added: rangesOf(nextIds.map(() => true)) }
+    return { removed: [{ start: prefix, end: prefix + n }], added: [{ start: prefix, end: prefix + m }], approximate: true }
   }
   const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1))
   for (let i = n - 1; i >= 0; i -= 1) {
     for (let j = m - 1; j >= 0; j -= 1) {
       dp[i][j] =
-        prevIds[i] === nextIds[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+        prev[i] === next[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
     }
   }
   const keepPrev = new Array(n).fill(false)
@@ -47,7 +56,7 @@ export function lcsRanges(prevIds, nextIds) {
   let i = 0
   let j = 0
   while (i < n && j < m) {
-    if (prevIds[i] === nextIds[j]) {
+    if (prev[i] === next[j]) {
       keepPrev[i] = true
       keepNext[j] = true
       i += 1
@@ -59,8 +68,9 @@ export function lcsRanges(prevIds, nextIds) {
     }
   }
   return {
-    removed: rangesOf(keepPrev.map((keep) => !keep)),
-    added: rangesOf(keepNext.map((keep) => !keep)),
+    removed: shift(rangesOf(keepPrev.map((keep) => !keep))),
+    added: shift(rangesOf(keepNext.map((keep) => !keep))),
+    approximate: false,
   }
 }
 
@@ -140,11 +150,20 @@ export function diffCaches(prevSnapshot, nextSnapshot, contextIds = []) {
   const nextById = new Map(nextEntries.map((entry) => [entry.id, entry]))
   const added = nextEntries.filter((entry) => !prevById.has(entry.id))
   const evicted = prevEntries.filter((entry) => !nextById.has(entry.id))
+  const modified = nextEntries.filter((entry) => prevById.has(entry.id)).map((entry) => {
+    const before = prevById.get(entry.id).token_ids || []
+    const after = entry.token_ids || []
+    const changes = []
+    for (let position = 0; position < Math.max(before.length, after.length); position += 1) {
+      if (before[position] !== after[position]) changes.push({ position, before: before[position], after: after[position] })
+    }
+    return { entry, changes }
+  }).filter((row) => row.changes.length)
   const unusable = nextEntries
     .map((entry) => {
       const ids = entry.token_ids || []
       const common = commonPrefix(ids, contextIds)
-      if (common >= ids.length) return null // a full prefix: usable as-is
+      if (common >= ids.length && ids.length < contextIds.length) return null // leave one input token to process
       return {
         entry,
         divergence: common,
@@ -155,6 +174,7 @@ export function diffCaches(prevSnapshot, nextSnapshot, contextIds = []) {
   return {
     added,
     evicted,
+    modified,
     unusable,
     memoryChange: (nextSnapshot?.total_bytes ?? 0) - (prevSnapshot?.total_bytes ?? 0),
   }
