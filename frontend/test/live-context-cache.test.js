@@ -9,6 +9,8 @@ import { buildMapModel } from '../src/mapModel.js'
 let vite
 let Stage
 let App
+let Lens
+let TapeMap
 
 before(async () => {
   vite = await createServer({
@@ -18,6 +20,8 @@ before(async () => {
   })
   ;({ default: Stage } = await vite.ssrLoadModule('/src/Stage.jsx'))
   ;({ default: App } = await vite.ssrLoadModule('/src/App.jsx'))
+  ;({ default: Lens } = await vite.ssrLoadModule('/src/Lens.jsx'))
+  ;({ default: TapeMap } = await vite.ssrLoadModule('/src/TapeMap.jsx'))
 })
 
 after(async () => {
@@ -215,6 +219,160 @@ describe('the map view model (plan cases)', () => {
     }
     assert.equal(warnings.length, 1)
     assert.match(warnings[0], /disagrees with the server/)
+  })
+})
+
+describe('Stage states (SSR)', () => {
+  const noPrediction = { ...report, cache_prediction: { entry_id: null, reused_tokens: 0, reason: 'no compatible cache entry' } }
+  const turn = (n) => ({ id: `turn-${n}`, n, context: report, cache: { entries: [] } })
+
+  it('a typed turn-2 state shows the prediction in the pipeline and the loading caption', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(Stage, stageProps({
+        turns: [turn(1), turn(2)],
+        prevTurn: turn(1),
+        draft: 'What is my name?',
+      })),
+    )
+    assert.match(html, />10 from #1</)
+    assert.match(html, />27 tokens</)
+    // Live entry token lists load in an effect, so SSR shows the pending caption.
+    assert.match(html, /reading the saved states on the server/)
+    assert.match(html, /Cache lookup/)
+  })
+
+  it('reuse off shows no match and every token computed', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(Stage, stageProps({
+        state: { ...stageProps().state, config: { cache_reuse: false } },
+      })),
+    )
+    assert.doesNotMatch(html, />10 from #1</)
+    assert.match(html, />no match</)
+    assert.match(html, />37 tokens</)
+  })
+
+  it('a prediction of nothing reused reads as no match', () => {
+    const html = renderToStaticMarkup(React.createElement(Stage, stageProps({ preview: noPrediction })))
+    assert.match(html, />no match</)
+    assert.match(html, />37 tokens</)
+  })
+
+  it('a historical turn draws its bars, the restored entry and the recorded caption', () => {
+    const entry2 = { id: 2, kind: 'after-generation', token_ids: [...T2.slice(0, 13), '<think>', 'x'], nbytes: 1 }
+    const html = renderToStaticMarkup(
+      React.createElement(Stage, stageProps({
+        viewTurn: {
+          id: 'turn-3',
+          n: 3,
+          context: report,
+          thinking: 2,
+          generated: 6,
+          cache: {
+            entries: [{ id: 1, kind: 'checkpoint', token_ids: ENTRY1, nbytes: 1 }, entry2],
+            last_lookup: { entry_id: 1, reused_tokens: 10 },
+          },
+        },
+        viewTurnId: 'turn-3',
+      })),
+    )
+    assert.match(html, /Turn 3: /)
+    assert.match(html, /restores 10 tokens from #1/)
+    assert.match(html, /✓ restored/)
+    assert.match(html, /breaks at 13/)
+    assert.match(html, />2 thinking · 4 answer</)
+  })
+})
+
+describe('Lens (SSR)', () => {
+  const entries = [
+    { id: 1, kind: 'checkpoint', token_ids: ENTRY1 },
+    { id: 2, kind: 'after-generation', token_ids: [...T2.slice(0, 6), 'DIFFERENT', ...T2.slice(7, 12)] },
+  ]
+  const model = buildMapModel({ report, entries })
+
+  it('marks same chips before the break and a diff chip at the break', () => {
+    const html = renderToStaticMarkup(React.createElement(Lens, { model, selectedEntryId: 2 }))
+    assert.match(html, /entry #2 breaks at position 6/)
+    assert.match(html, /chip same/)
+    assert.equal((html.match(/chip diff/g) || []).length, 2) // context row + entry row
+    assert.match(html, /chip after/)
+    assert.match(html, /after-reply/)
+    // Entry labels are shown as raw ids when no decoded pieces are supplied.
+    assert.match(html, /⟨DIFFERENT⟩/)
+  })
+
+  it('a fully matching entry has no diff chip and says so', () => {
+    const html = renderToStaticMarkup(React.createElement(Lens, { model, selectedEntryId: 1 }))
+    assert.match(html, /entry #1 matches all 10 of its tokens/)
+    assert.doesNotMatch(html, /chip diff/)
+    assert.match(html, /chip same/)
+  })
+
+  it('with no selection it prompts for a bar', () => {
+    const html = renderToStaticMarkup(React.createElement(Lens, { model, selectedEntryId: null }))
+    assert.match(html, /select a bar to compare/)
+    assert.match(html, /no bar selected/)
+  })
+})
+
+describe('TapeMap (SSR)', () => {
+  const entries = [
+    { id: 1, kind: 'checkpoint', token_ids: ENTRY1 },
+    { id: 2, kind: 'after-generation', token_ids: [...T2.slice(0, 6), 'DIFFERENT', ...T2.slice(7, 12)] },
+  ]
+  const render = (model, props = {}) =>
+    renderToStaticMarkup(React.createElement(TapeMap, { model, ...props }))
+
+  it('draws ruler ticks, one broken bar and one usable ✓ bar', () => {
+    const html = render(buildMapModel({ report, entries }))
+    assert.match(html, /position<\/text>/)
+    assert.match(html, />0<\/text>/)
+    assert.match(html, /class="m-tick"/)
+    assert.match(html, /breaks at 6/)
+    assert.match(html, /✕/)
+    assert.match(html, /✓ restored/)
+    assert.equal((html.match(/breaks at/g) || []).length, 1)
+  })
+
+  it('an unchosen full-prefix bar reads "usable"', () => {
+    const html = render(buildMapModel({
+      report: { ...report, cache_prediction: { entry_id: null, reused_tokens: 0 } },
+      entries: [entries[0]],
+    }))
+    assert.match(html, /✓ usable/)
+    assert.doesNotMatch(html, /✓ restored/)
+  })
+
+  it('marks new bars, evicted ghosts and "+" ticks', () => {
+    const model = buildMapModel({
+      report,
+      entries: [entries[0]],
+      prevEntries: [{ id: 9, kind: 'checkpoint', token_ids: ENTRY1 }],
+      prevIds: T2.slice(0, 20),
+      comparePrev: true,
+    })
+    const html = render(model)
+    assert.match(html, />NEW</)
+    assert.match(html, />evicted</)
+    assert.match(html, /class="m-ghost"|m-ghost/)
+    assert.equal((html.match(/>\+<\/text>/g) || []).length, model.ticks.length)
+  })
+
+  it('folds bars past maxRows into a "+N more" row', () => {
+    const html = render(buildMapModel({ report, entries }), { maxRows: 1 })
+    assert.match(html, /\+1 more saved state \(longest first\)/)
+  })
+
+  it('shows the relabel warning on a relabeled bar', () => {
+    const html = render(buildMapModel({ report, entries: [{ ...entries[0], relabels: 1 }] }))
+    assert.match(html, /label ≠ state/)
+  })
+
+  it('the empty page draws the ghost tape and the empty-cache line', () => {
+    const html = render(buildMapModel({ report: { token_ids: [], token_pieces: [], spans: [] }, entries: [] }))
+    assert.match(html, /type a message to see its tokens/)
+    assert.match(html, /no saved states yet/)
   })
 })
 
