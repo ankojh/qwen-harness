@@ -1,31 +1,9 @@
 import { useState } from 'react'
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
+import CacheDiff from './CacheDiff.jsx'
+import { highlightSpecial } from './highlight.jsx'
 
 function HighlightedPrompt({ text, thinkStart, thinkEnd }) {
-  const markers = [thinkStart, thinkEnd].filter(Boolean).map(escapeRegExp)
-  const pattern = new RegExp(
-    `(<\\|[^|]*\\|>${markers.length ? `|${markers.join('|')}` : ''})`,
-    'g',
-  )
-  return (
-    <pre className="prompt-text">
-      {text
-        .split(pattern)
-        .filter((part) => part !== '')
-        .map((part, index) => {
-          const special =
-            part.startsWith('<|') || part === thinkStart || part === thinkEnd
-          return special ? (
-            <span key={index} className="tok-special">{part}</span>
-          ) : (
-            <span key={index}>{part}</span>
-          )
-        })}
-    </pre>
-  )
+  return <pre className="prompt-text">{highlightSpecial(text, thinkStart, thinkEnd)}</pre>
 }
 
 function BudgetBar({ budget }) {
@@ -278,6 +256,8 @@ export default function InputPanel({
             <h4>Cache prediction</h4>
             <div>{preview.cache_prediction?.reason || 'no prediction'}</div>
           </div>
+
+          <CacheDiff preview={preview} thinkStart={thinkStart} thinkEnd={thinkEnd} />
 
           <div className="inspector-block">
             <h4>Submitted messages</h4>

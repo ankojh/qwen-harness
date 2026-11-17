@@ -429,6 +429,7 @@ def build_prompt(
                 "starts_in_thinking": False,
                 "prompt_hash": _hash_tokens([]),
                 "cache_prediction": None,
+                "cache_entries": [],
                 "template": template_report,
             }
             return report
@@ -642,12 +643,14 @@ def build_prompt(
             spans = _token_spans(token_ids, tokenizer, submitted)
 
     cache_prediction = None
+    cache_entries: list[dict[str, Any]] = []
     checkpoint_estimate = None
     checkpoint_estimate_reason: str | None = None
     if cache_store is None or compat_key is None:
         checkpoint_estimate_reason = "no prompt cache is available"
     else:
         cache_prediction = cache_store.peek(token_ids, compat_key)
+        cache_entries = cache_store.compare(token_ids, compat_key)
         planned = [
             entry["position"]
             for entry in checkpoints
@@ -687,6 +690,7 @@ def build_prompt(
         "starts_in_thinking": starts_in_thinking,
         "prompt_hash": _hash_tokens(token_ids),
         "cache_prediction": cache_prediction,
+        "cache_entries": cache_entries,
         "template": template_report,
     }
     return report

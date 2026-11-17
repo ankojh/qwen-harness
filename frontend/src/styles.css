@@ -441,3 +441,28 @@ details details { margin-top: 8px; margin-bottom: 6px; }
   .topbar-meta { flex-wrap: wrap; gap: 8px; }
   .log-row { grid-template-columns: 42px 74px 130px minmax(0, 1fr); }
 }
+
+/* Context <-> cache diff (prompt inspector) */
+.cache-diff-picker { display: flex; align-items: center; gap: 8px; margin: 4px 0 6px; }
+.cache-diff-picker select { flex: 1; min-width: 0; }
+.diff-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; margin-bottom: 6px; color: var(--muted); }
+.swatch.same { background: var(--ok-soft); border: 1px solid var(--ok); }
+.swatch.del { background: var(--danger-soft); border: 1px solid var(--danger); }
+.swatch.add { background: var(--accent-soft); border: 1px solid var(--accent); }
+.swatch.later { background: var(--panel); border: 1px solid var(--border); }
+.diff-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 6px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--code-bg); }
+.diff-head { padding: 4px 8px; font-size: 11px; color: var(--muted); background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.diff-head + .diff-head { border-left: 1px solid var(--border); }
+.diff-row { display: contents; }
+.diff-cell { display: grid; grid-template-columns: 44px minmax(0, 1fr); min-width: 0; border-bottom: 1px solid var(--border-subtle); font-family: var(--mono); font-size: 12px; }
+.diff-cell:nth-child(2) { border-left: 1px solid var(--border); }
+.diff-pos { padding: 2px 6px 2px 0; text-align: right; color: var(--muted); font-size: 11px; border-right: 1px solid var(--border-subtle); }
+.diff-text { padding: 2px 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-cell.same .diff-text { background: var(--ok-soft); }
+.diff-cell.del .diff-text { background: var(--danger-soft); }
+.diff-cell.add .diff-text { background: var(--accent-soft); }
+.diff-cell.later .diff-text { color: var(--muted); }
+.diff-cell.empty .diff-text { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--border-subtle) 6px 7px); }
+.diff-elided { color: var(--muted); font-style: italic; font-family: system-ui, sans-serif; }
+.diff-toggle { grid-column: 1 / -1; justify-self: start; margin: 2px 8px; }
+.diff-cut { grid-column: 1 / -1; border-top: 2px solid var(--danger); color: var(--danger); font-size: 11px; padding: 1px 8px; text-align: right; background: var(--panel); }

@@ -27,9 +27,11 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from mlx_lm.models.cache import can_trim_prompt_cache
 from pydantic import BaseModel, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from cache_diff import add_text, diff_tokens
 from config import AppConfig, PRESETS, defaults_dict, fields_schema
 from events import EventLog, format_sse
 from generation import GenerationStore, run_generation
@@ -181,6 +183,11 @@ def _apply_config(ctx: AppState, new_config: AppConfig) -> dict[str, Any]:
 class PreviewRequest(BaseModel):
     session: Session
     include_pieces: bool = False
+
+
+class CacheDiffRequest(BaseModel):
+    entry_id: int
+    token_ids: list[int]
 
 
 class GenerateRequest(BaseModel):
@@ -521,6 +528,29 @@ async def cache_entry(entry_id: int, request: Request):
     return await asyncio.get_running_loop().run_in_executor(
         ctx.executor, _read_cache_entry, entry, ctx.loaded.tokenizer, layer_types
     )
+
+
+@api.post("/cache/diff")
+async def diff_cache_entry(payload: CacheDiffRequest, request: Request):
+    """Diff one entry's token ids against a previewed prompt.  Tokenizer only."""
+    ctx = _ctx(request)
+    if ctx.loaded is None:
+        raise HTTPException(status_code=409, detail="load the model first")
+    entry = ctx.cache.get_entry(payload.entry_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"cache entry {payload.entry_id} is gone (evicted or cleared); preview again",
+        )
+    cached = list(entry.tokens)
+    diff = diff_tokens(cached, payload.token_ids, trimmable=can_trim_prompt_cache(entry.cache))
+    if entry.compat_key != _compat_key(ctx):
+        diff["reusable_tokens"] = 0
+        diff["prefill_tokens"] = len(payload.token_ids)
+        diff["reason"] = "built with a different model, adapter or kv_* settings"
+    add_text(diff, cached, payload.token_ids, ctx.loaded.tokenizer)
+    diff["entry"] = {"id": entry.id, "kind": entry.kind, "after_message": entry.after_message}
+    return diff
 
 
 # ----------------------------------------------------------------------- SSE

@@ -145,6 +145,8 @@ Presets, **Export JSON**, **Import JSON**, **Reset to defaults**, and the **Adva
 - **Preview prompt** renders the exact prompt with special tokens and think markers highlighted. **auto-refresh** repeats it after a 600 ms debounce and only calls the tokenizer.
 - The inspector shows: budget bar (input, output reservation, remaining), token count, checkpoint position, starts-in-thinking, prompt hash, submitted messages, dropped messages, transformation lines, template report (variables, passed/unused/reserved kwargs, tokenize mismatch), cache prediction, planned checkpoints with accepted/skipped reasons, and the estimated snapshot cost. The token table (id + piece) is opt-in.
 
+- **Context ↔ cache diff** puts one stored cache entry (left) beside the previewed prompt (right), aligned by token position. It defaults to the entry with the longest common prefix, which is usually the miss worth explaining. Green is the shared prefix (the only part a non-trimmable cache can reuse), red is only in the entry, blue is only in the prompt and gets prefilled, and grey text matches again later but can't be reused. The diff runs on token ids (`POST /api/cache/diff`, tokenizer only); matches shorter than 4 tokens after the divergence are folded into the change around them.
+
 The hash is the link between preview and submission: the output panel compares the preview hash with the generation record's `prompt_hash`.
 
 ---

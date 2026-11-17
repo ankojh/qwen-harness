@@ -337,6 +337,40 @@ class PromptCacheStore:
         }
 
     @_locked
+    def compare(self, tokens: list[int], compat_key: tuple) -> list[dict[str, Any]]:
+        """Every entry against one prompt, for the inspector's diff picker.
+
+        Uses the same usability rule as ``_find``; does not touch LRU.
+        """
+        limit = max(len(tokens) - 1, 0)
+        rows = []
+        for entry in self._entries:
+            compatible = entry.compat_key == compat_key
+            common = self._common_prefix(entry.tokens, tokens)
+            reuse = min(common, limit)
+            if not compatible:
+                reuse, reason = 0, "built with a different model, adapter or kv_* settings"
+            elif reuse <= 0:
+                reuse, reason = 0, f"diverges at token {common}"
+            elif reuse < len(entry.tokens) and not can_trim_prompt_cache(entry.cache):
+                reuse, reason = 0, f"diverges at token {common} before its end; not trimmable"
+            else:
+                reason = ""
+            rows.append(
+                {
+                    "id": entry.id,
+                    "kind": entry.kind,
+                    "after_message": entry.after_message,
+                    "tokens": len(entry.tokens),
+                    "compatible": compatible,
+                    "common_prefix": common,
+                    "reusable_tokens": reuse,
+                    "reason": reason,
+                }
+            )
+        return rows
+
+    @_locked
     def lookup(
         self, tokens: list[int], compat_key: tuple
     ) -> tuple[list[Any] | None, int, dict[str, Any]]:

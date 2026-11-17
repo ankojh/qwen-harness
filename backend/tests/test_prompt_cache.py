@@ -469,3 +469,28 @@ def test_describe_cache_layers_reports_every_layer_in_order():
         "full_attention",
         "full_attention",
     ]
+
+
+# -------------------------------------------------------------------- compare
+def test_compare_reports_every_entry_with_the_lookup_rule():
+    store = PromptCacheStore()
+    insert(store, [1, 2], after_message=1)  # prefix of the prompt
+    insert(store, [1, 2, 9, 9], kind="after-generation")  # diverges before its end
+    insert(store, [1, 2, 3], key=OTHER_KEY)  # incompatible settings
+    rows = {row["id"]: row for row in store.compare([1, 2, 3, 4], KEY)}
+
+    assert rows[1]["reusable_tokens"] == 2 and rows[1]["reason"] == ""
+    assert rows[2]["common_prefix"] == 2
+    assert rows[2]["reusable_tokens"] == 0
+    assert "not trimmable" in rows[2]["reason"]
+    assert rows[3]["compatible"] is False and rows[3]["reusable_tokens"] == 0
+    # The dry-run prediction agrees with the best usable row.
+    assert store.peek([1, 2, 3, 4], KEY)["entry_id"] == 1
+
+
+def test_compare_does_not_touch_lru():
+    store = PromptCacheStore()
+    insert(store, [1, 2])
+    before = store.summary()["entries"][0]["last_used"]
+    store.compare([1, 2, 3], KEY)
+    assert store.summary()["entries"][0]["last_used"] == before
