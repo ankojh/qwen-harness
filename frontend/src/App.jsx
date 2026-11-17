@@ -4,10 +4,8 @@ import ConfigPanel from './ConfigPanel.jsx'
 import InputPanel from './InputPanel.jsx'
 import OutputPanel from './OutputPanel.jsx'
 import EventLog from './EventLog.jsx'
-import ChatInput from './ChatInput.jsx'
-import LiveOutput from './LiveOutput.jsx'
-import ContextPanel from './ContextPanel.jsx'
-import CachePanel from './CachePanel.jsx'
+import Conversation from './Conversation.jsx'
+import Stage from './Stage.jsx'
 import {
   clearCache,
   formatError,
@@ -45,31 +43,7 @@ function newRequestId() {
 }
 
 // Turns 1..N (their recorded snapshots) plus Next (the request being typed).
-function TurnSelector({ turns, viewTurnId, onSelect }) {
-  if (turns.length === 0) return null
-  return (
-    <div className="turn-selector">
-      <span className="muted">Viewing</span>
-      {turns.map((turn) => (
-        <button
-          key={turn.id}
-          type="button"
-          className={viewTurnId === turn.id ? 'active' : ''}
-          onClick={() => onSelect(viewTurnId === turn.id ? null : turn.id)}
-        >
-          Turn {turn.n}
-        </button>
-      ))}
-      <button
-        type="button"
-        className={viewTurnId === null ? 'active' : ''}
-        onClick={() => onSelect(null)}
-      >
-        Next
-      </button>
-    </div>
-  )
-}
+// Rendered by the Stage's folded timeline; kept here for the record.
 
 export default function App() {
   const [state, setState] = useState(null)
@@ -79,6 +53,7 @@ export default function App() {
     raw_text: '',
   })
   const [draft, setDraft] = useState('')
+  const [editing, setEditing] = useState(false)
   const [lastInput, setLastInput] = useState('')
   const [turns, setTurns] = useState([])
   const [detailsTab, setDetailsTab] = useState(null)
@@ -97,12 +72,59 @@ export default function App() {
   const activeGenRef = useRef(null)
   // Generation started by Send whose answer still has to join the session.
   const pendingTurnRef = useRef(null)
+  // One-line descriptions of the edits applied since the last turn.  The
+  // next recorded turn takes them and clears the list.
+  const [pendingEdits, setPendingEdits] = useState([])
+  const pendingEditsRef = useRef([])
+  // SSE progress of the running generation: the lookup event, the latest
+  // prefill chunk, and the cache changes, for the pipeline/map live view.
+  const [runProgress, setRunProgress] = useState(null)
+  // Which message the chat bubbles are hovering (lights its tape segment).
+  const [hoveredMessage, setHoveredMessage] = useState(null)
+  // A bubble was clicked: {index, seq}; the Stage opens it in the Inspector.
+  const [bubbleClick, setBubbleClick] = useState(null)
+
+  const logEdit = useCallback((line) => {
+    pendingEditsRef.current = [...pendingEditsRef.current, line]
+    setPendingEdits(pendingEditsRef.current)
+  }, [])
 
   const refreshState = useCallback(async () => {
     const data = await getState()
     setState(data)
     return data
   }, [])
+
+  // A cache action (delete, relabel, restore, save checkpoint) with its
+  // edit-log line: run it, log it, refresh state, surface errors.  ``line``
+  // may be a function of the result (for labels that need the entry id).
+  const runCacheAction = useCallback(
+    async (action, line, options = {}) => {
+      if (!options.silent) setActionError(null)
+      try {
+        const result = await action()
+        logEdit(typeof line === 'function' ? line(result) : line)
+        await refreshState()
+        return result
+      } catch (error) {
+        if (!options.silent) setActionError(formatError(error.detail || error))
+        throw error
+      }
+    },
+    [logEdit, refreshState],
+  )
+
+  // The Edit view applies its staged copy: it replaces the conversation and
+  // each change becomes an edit-log line.
+  const applyStagedSession = useCallback(
+    (nextSession, lines) => {
+      setSession(nextSession)
+      setPreview(null)
+      setViewTurnId(null)
+      lines.forEach(logEdit)
+    },
+    [logEdit],
+  )
 
   const refreshGeneration = useCallback(async (id) => {
     const record = await getGeneration(id)
@@ -196,6 +218,24 @@ export default function App() {
           setGeneration(null)
           setTokens([])
           setActionError(null)
+          setRunProgress({})
+        } else if (type === 'cache.lookup') {
+          setRunProgress((previous) => (previous ? { ...previous, lookup: data } : previous))
+        } else if (type === 'prefill.chunk') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            prefill: { processed_tokens: data.processed_tokens, total_tokens: data.total_tokens },
+          } : previous)
+        } else if (type === 'cache.insert') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            saved: { ...(previous.saved || { added: 0, evicted: 0 }), added: (previous.saved?.added || 0) + 1 },
+          } : previous)
+        } else if (type === 'cache.evict') {
+          setRunProgress((previous) => previous ? {
+            ...previous,
+            saved: { ...(previous.saved || { added: 0, evicted: 0 }), evicted: (previous.saved?.evicted || 0) + 1 },
+          } : previous)
         } else if (type === 'generation.finished') {
           if (activeGenRef.current === data.generation_id) activeGenRef.current = null
           setActiveGenId(null)
@@ -209,6 +249,12 @@ export default function App() {
           type === 'model.unloaded' ||
           type === 'model.error' ||
           type === 'cache.clear' ||
+          type === 'cache.delete' ||
+          type === 'cache.relabel' ||
+          type === 'cache.restore' ||
+          type === 'cache.insert' ||
+          type === 'cache.checkpoint' ||
+          type === 'config.changed' ||
           type === 'cache.evict'
         ) {
           refreshState().catch(() => {})
@@ -238,9 +284,16 @@ export default function App() {
   }, [nextSession])
 
   // Auto-refresh calls the tokenizer only, never the model.  It also reruns
-  // when the cache changes, so the reuse prediction stays current.
+  // when the cache changes, so the reuse prediction stays current.  The
+  // previous report stays on screen until the new one arrives: the tape
+  // redraws in place instead of flashing empty (the moment after a run is
+  // the animated switch the map teaches with).
   useEffect(() => {
-    if (!autoPreview || !state?.model_loaded) return undefined
+    if (activeGenId) return undefined
+    if (!autoPreview || !state?.model_loaded) {
+      setPreview(null)
+      return undefined
+    }
     if (!hasContext) {
       setPreview(null)
       setPreviewError(null)
@@ -262,7 +315,7 @@ export default function App() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [autoPreview, nextSession, hasContext, state?.model_loaded, state?.config, state?.cache?.accounted_bytes, state?.cache?.entries_count])
+  }, [autoPreview, nextSession, hasContext, state?.model_loaded, state?.config, state?.cache, activeGenId])
 
   // When a run started by Send finishes, its answer joins the conversation
   // (without the thinking, which the chat template would drop anyway) and the
@@ -273,6 +326,10 @@ export default function App() {
     pendingTurnRef.current = null
     const answer = (generation.channels?.answer || '').trim()
     const submitted = generation.session
+    // The edits applied since the last turn belong to this one.
+    const edits = pendingEditsRef.current
+    pendingEditsRef.current = []
+    setPendingEdits([])
     setSession({
       ...submitted,
       messages: answer
@@ -290,7 +347,10 @@ export default function App() {
         generated,
         thinking: (generation.tokens || []).filter((token) => token.channel === 'thinking').length,
         context: generation.prompt,
+        prefill: generation.stats?.prefill || null,
+        finish: generation.finish,
         cache: null,
+        edits,
       },
     ])
     ;(async () => {
@@ -301,7 +361,7 @@ export default function App() {
         const snapshot = {
           entries,
           total_bytes: freshState.cache?.total_bytes ?? 0,
-          last_lookup: freshState.cache?.last_lookup ?? null,
+          last_lookup: generation.cache_lookup ?? freshState.cache?.last_lookup ?? null,
         }
         setTurns((previous) =>
           previous.map((turn) => (turn.id === generation.id ? { ...turn, cache: snapshot } : turn)),
@@ -327,6 +387,12 @@ export default function App() {
     try {
       const data = await putConfig(patch)
       setState(data)
+      if ('cache_reuse' in patch) {
+        logEdit(`turned cache reuse ${patch.cache_reuse ? 'on' : 'off'}`)
+      }
+      if ('cache_checkpoints' in patch) {
+        logEdit(`changed cache checkpoints to ${patch.cache_checkpoints}`)
+      }
     } catch (error) {
       setConfigError(formatError(error.detail || error))
     } finally {
@@ -361,7 +427,10 @@ export default function App() {
   async function handleClearCache() {
     setSaving(true)
     try {
-      setState(await clearCache())
+      const before = state.cache?.entries_count ?? 0
+      const data = await clearCache()
+      setState(data)
+      logEdit(`cleared the cache (${before} ${before === 1 ? 'entry' : 'entries'})`)
     } catch (error) {
       setActionError(formatError(error.detail || error))
     } finally {
@@ -385,6 +454,7 @@ export default function App() {
 
   async function handleSend() {
     const text = draft.trim()
+    if (editing) { setActionError('Apply or discard the staged context edits before sending.'); return }
     if (!text || activeGenId || !state?.model_loaded) return
     const previous = session
     const next = {
@@ -392,12 +462,20 @@ export default function App() {
       mode: 'messages',
       messages: [...session.messages, { ...EMPTY_MESSAGE, content: text }],
     }
+    setViewTurnId(null)
     setSession(next)
+    // Fetch the submitted request's report immediately (the debounced preview
+    // may not have landed yet, and auto-preview pauses during the run): it
+    // freezes the tape on the prompt while the run is in flight.
     setDraft('')
     setLastInput(text)
     setActionError(null)
     try {
-      const response = await startGeneration(newRequestId(), next)
+      const [response, submittedReport] = await Promise.all([
+        startGeneration(newRequestId(), next),
+        previewPrompt(next).catch(() => null),
+      ])
+      if (submittedReport) setPreview(submittedReport)
       pendingTurnRef.current = response.generation_id
       activeGenRef.current = response.generation_id
       setActiveGenId(response.generation_id)
@@ -413,6 +491,8 @@ export default function App() {
 
   function handleNewConversation() {
     pendingTurnRef.current = null
+    pendingEditsRef.current = []
+    setPendingEdits([])
     setSession((previous) => ({ ...previous, mode: 'messages', messages: [], raw_text: '' }))
     setTurns([])
     setViewTurnId(null)
@@ -421,6 +501,7 @@ export default function App() {
     setGeneration(null)
     setTokens([])
     setPreview(null)
+    setRunProgress(null)
   }
 
   async function handleStop() {
@@ -463,7 +544,7 @@ export default function App() {
       <div className="boot">
         <strong>Qwen Harness</strong>
         <span className="muted">connecting to the local backend…</span>
-        {actionError && <span className="note note-error">{actionError}</span>}
+        {actionError && <><span className="note note-error">{actionError}</span><button type="button" onClick={() => refreshState().catch((error) => setActionError(error.message))}>Retry connection</button></>}
       </div>
     )
   }
@@ -481,13 +562,13 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <strong>Qwen Harness</strong>
-          <span className="muted">{state.config?.model_path}</span>
+          <span className="muted">Context & cache lab · {window.location.port || 'local'}</span>
         </div>
         <div className="topbar-meta">
           <span className={`pill ${modelLoaded ? 'pill-ok' : 'pill-off'}`}>
             {modelLoaded ? 'model loaded' : 'model idle'}
           </span>
-          <span>{running ? 'generating' : 'idle'}</span>
+          <span>{sseState !== 'connected' ? 'reconnecting · live state may be stale' : running ? 'generating' : 'idle'}</span>
           <button
             type="button"
             className="menu-button"
@@ -509,72 +590,66 @@ export default function App() {
 
       <div className="main">
         <PanelGroup direction="horizontal" style={{ height: '100%' }}>
-          <Panel defaultSize={50} minSize={25}>
-            <PanelGroup direction="vertical" style={{ height: '100%' }}>
-              <Panel defaultSize={28} minSize={15}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Input</div>
-                  <ChatInput
-                    draft={draft}
-                    onDraftChange={setDraft}
-                    turns={turns.length}
-                    modelLoaded={modelLoaded}
-                    running={running}
-                    busy={busy}
-                    onSend={handleSend}
-                    onStop={handleStop}
-                    onNewConversation={handleNewConversation}
-                    onLoadModel={() => handleModel('load')}
-                  />
-                </div>
-              </Panel>
-              <PanelResizeHandle className="resize horizontal" />
-              <Panel defaultSize={72} minSize={20}>
-                <div className="panel-scroll">
-                  <div className="panel-title">Output</div>
-                  <LiveOutput generation={generation} tokens={tokens} running={running} lastInput={lastInput} />
-                </div>
-              </Panel>
-            </PanelGroup>
+          <Panel defaultSize={30} minSize={22}>
+            <div className="panel-scroll">
+              <div className="panel-title">Conversation</div>
+              <Conversation
+                session={session}
+                draft={draft}
+                onDraftChange={setDraft}
+                turns={turns}
+                modelLoaded={modelLoaded}
+                running={running}
+                busy={busy || editing}
+                editing={editing}
+                generation={generation}
+                tokens={tokens}
+                hoveredMessage={hoveredMessage}
+                onHoverMessage={setHoveredMessage}
+                onSelectMessage={(index) => setBubbleClick((previous) => ({ index, seq: (previous?.seq || 0) + 1 }))}
+                onSend={handleSend}
+                onStop={handleStop}
+                onNewConversation={handleNewConversation}
+                onLoadModel={() => handleModel('load')}
+              />
+            </div>
           </Panel>
 
           <PanelResizeHandle className="resize vertical" />
 
-          <Panel defaultSize={50} minSize={25}>
-            <div className="right-column">
-              <TurnSelector turns={turns} viewTurnId={viewTurnId} onSelect={setViewTurnId} />
-              <PanelGroup direction="vertical" style={{ flex: 1, minHeight: 0 }}>
-                <Panel defaultSize={55} minSize={15}>
-                  <div className="panel-scroll">
-                    <div className="panel-title">Context <span className="title-note">lives in this browser tab, sent in full every request</span></div>
-                    <ContextPanel
-                      preview={preview}
-                      previewError={previewError}
-                      session={session}
-                      draft={draft}
-                      turns={turns}
-                      modelLoaded={modelLoaded}
-                      viewTurn={viewTurn}
-                      prevTurn={prevTurn}
-                    />
-                  </div>
-                </Panel>
-                <PanelResizeHandle className="resize horizontal" />
-                <Panel defaultSize={45} minSize={15}>
-                  <div className="panel-scroll">
-                    <div className="panel-title">Cache <span className="title-note">lives on the server, reused on an exact prefix match</span></div>
-                    <CachePanel
-                      state={state}
-                      preview={preview}
-                      generation={generation}
-                      busy={busy}
-                      onClearCache={handleClearCache}
-                      viewTurn={viewTurn}
-                      prevTurn={prevTurn}
-                    />
-                  </div>
-                </Panel>
-              </PanelGroup>
+          <Panel defaultSize={70} minSize={35}>
+            <div className="panel-scroll">
+              <div className="panel-title">
+                What the model sees <span className="title-note">one ruler: the context tape, the restored/computed band, and every saved state</span>
+              </div>
+              <Stage
+                state={state}
+                session={session}
+                draft={draft}
+                preview={preview}
+                previewError={previewError}
+                generation={generation}
+                tokens={tokens}
+                running={running}
+                busy={busy}
+                modelLoaded={modelLoaded}
+                turns={turns}
+                viewTurn={viewTurn}
+                viewTurnId={viewTurnId}
+                prevTurn={prevTurn}
+                pendingEdits={pendingEdits}
+                systemPrompt={state.config?.system_prompt || ''}
+                runProgress={runProgress}
+                hoveredMessage={hoveredMessage}
+                bubbleClick={bubbleClick}
+                onViewTurnChange={setViewTurnId}
+                onApplyStaged={applyStagedSession}
+                onCacheAction={runCacheAction}
+                onConfigChange={updateConfig}
+                onClearCache={handleClearCache}
+                onEditingChange={setEditing}
+                onLoadModel={() => handleModel('load')}
+              />
             </div>
           </Panel>
         </PanelGroup>

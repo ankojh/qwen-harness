@@ -48,7 +48,7 @@ class CacheEntry:
     id: int
     tokens: list[int]
     cache: list[Any]
-    kind: str  # "checkpoint" or "after-generation"
+    kind: str  # "checkpoint", "manual" or "after-generation"
     compat_key: tuple
     nbytes: int
     arrays_bytes: int = 0  # recurrent state of the 24 linear-attention layers
@@ -56,6 +56,10 @@ class CacheEntry:
     after_message: int | None = None  # only for checkpoints
     created: float = field(default_factory=time.time)
     last_used: int = 0
+    # Token relabels: {position, original_id, new_id}.  A relabelled entry
+    # claims different tokens than the state it stores; the first original id
+    # for a position is kept when it is relabelled again.
+    relabels: list[dict[str, int]] = field(default_factory=list)
 
 
 BYTE_NOTE = (
@@ -232,6 +236,44 @@ class PromptCacheStore:
             index += 1
         return index
 
+    @staticmethod
+    def _assess(entry: CacheEntry, tokens: list[int], compat_key: tuple) -> dict[str, Any]:
+        """Explain exactly the same per-entry eligibility used by lookup."""
+        compatible = entry.compat_key == compat_key
+        common = PromptCacheStore._common_prefix(entry.tokens, tokens)
+        trimmable = can_trim_prompt_cache(entry.cache)
+        reuse = min(common, max(len(tokens) - 1, 0))
+        if not compatible:
+            reuse, reason = 0, "Different model or cache settings."
+        elif not tokens:
+            reuse, reason = 0, "No request to compare yet."
+        elif len(tokens) == 1:
+            reuse, reason = 0, "The only input token must still be processed."
+        elif common == 0:
+            reuse, reason = 0, "Different token IDs at position 0."
+        elif reuse < len(entry.tokens) and not trimmable:
+            reuse = 0
+            if common >= len(tokens):
+                reason = ("This state reaches or passes the request's end. At least one input "
+                          "token must be processed, and this state cannot rewind.")
+            else:
+                reason = (f"First different token at position {common}. This saved state "
+                          "continues past it and cannot rewind; a shorter checkpoint may work.")
+        elif reuse:
+            reason = (f"Can restore computed state for positions 0–{reuse - 1}; "
+                      f"process the remaining {len(tokens) - reuse} input tokens.")
+        else:
+            reason = "No usable saved prefix."
+        return {"shared_prefix": common, "reusable_tokens": reuse,
+                "compatible": compatible, "trimmable": trimmable, "reason": reason}
+
+    @_locked
+    def compare(self, tokens: list[int], compat_key: tuple) -> list[dict[str, Any]]:
+        """Read-only match explanations, without touching LRU or MLX arrays."""
+        return [{"id": entry.id, "kind": entry.kind, "after_message": entry.after_message,
+                 "token_ids": list(entry.tokens), "relabels": len(entry.relabels),
+                 **self._assess(entry, tokens, compat_key)} for entry in self._entries]
+
     @_locked
     def _find(self, tokens: list[int], compat_key: tuple) -> dict[str, Any]:
         """Pick the best *usable* entry.
@@ -258,11 +300,8 @@ class PromptCacheStore:
             ):
                 closest, closest_common = entry, common
 
-            reuse = min(common, limit)
+            reuse = self._assess(entry, tokens, compat_key)["reusable_tokens"]
             if reuse <= 0:
-                continue
-            if reuse < len(entry.tokens) and not can_trim_prompt_cache(entry.cache):
-                # This entry diverges before its end and cannot be shortened.
                 continue
             if (
                 best is None
@@ -290,6 +329,9 @@ class PromptCacheStore:
 
         if limit == 0:
             reason = "the prompt has only one token and it must be fed to the model"
+        elif closest_common >= len(tokens):
+            reason = ("at least one input token must be processed, but the closest "
+                      f"entry #{closest.id} reaches or passes the request's end and is not trimmable (cannot rewind)")
         elif closest_common <= 0:
             reason = (
                 f"closest entry #{closest.id} diverges at token 0 and the cache "
@@ -333,42 +375,9 @@ class PromptCacheStore:
             "entry_tokens": len(entry.tokens) if entry else 0,
             "reused_tokens": found["reuse_tokens"],
             "would_trim": found["trim_by"],
+            "relabeled": bool(entry and entry.relabels),
             "reason": reason,
         }
-
-    @_locked
-    def compare(self, tokens: list[int], compat_key: tuple) -> list[dict[str, Any]]:
-        """Every entry against one prompt, for the inspector's diff picker.
-
-        Uses the same usability rule as ``_find``; does not touch LRU.
-        """
-        limit = max(len(tokens) - 1, 0)
-        rows = []
-        for entry in self._entries:
-            compatible = entry.compat_key == compat_key
-            common = self._common_prefix(entry.tokens, tokens)
-            reuse = min(common, limit)
-            if not compatible:
-                reuse, reason = 0, "built with a different model, adapter or kv_* settings"
-            elif reuse <= 0:
-                reuse, reason = 0, f"diverges at token {common}"
-            elif reuse < len(entry.tokens) and not can_trim_prompt_cache(entry.cache):
-                reuse, reason = 0, f"diverges at token {common} before its end; not trimmable"
-            else:
-                reason = ""
-            rows.append(
-                {
-                    "id": entry.id,
-                    "kind": entry.kind,
-                    "after_message": entry.after_message,
-                    "tokens": len(entry.tokens),
-                    "compatible": compatible,
-                    "common_prefix": common,
-                    "reusable_tokens": reuse,
-                    "reason": reason,
-                }
-            )
-        return rows
 
     @_locked
     def lookup(
@@ -385,6 +394,7 @@ class PromptCacheStore:
                 "kind": entry.kind if entry else None,
                 "entry_tokens": len(entry.tokens) if entry else 0,
                 "reused_tokens": 0,
+                "relabeled": False,
                 "reason": found["reason"],
             }
             self.last_lookup = info
@@ -403,6 +413,7 @@ class PromptCacheStore:
             "entry_tokens": len(entry.tokens),
             "reused_tokens": reuse,
             "trimmed": trim_by,
+            "relabeled": bool(entry.relabels),
             "reason": (
                 f"reused {reuse} tokens from {entry.kind} entry #{entry.id}"
                 + (f" after trimming {trim_by}" if trim_by else "")
@@ -495,6 +506,11 @@ class PromptCacheStore:
             info["entries"] = len(self._entries)
             info["total_bytes"] = self._total_bytes
         return info
+
+    @_locked
+    def note_lookup(self, info: dict[str, Any]) -> None:
+        """Record a lookup that never touched an entry (reuse off, say)."""
+        self.last_lookup = info
 
     @_locked
     def touch_exact(self, tokens: list[int], compat_key: tuple) -> dict[str, Any] | None:
@@ -592,6 +608,96 @@ class PromptCacheStore:
                 return entry
         return None
 
+    # ------------------------------------------------------------- editing
+    @_locked
+    def remove(self, entry_id: int) -> dict[str, Any] | None:
+        """Delete one entry and emit ``cache.delete``.  Returns None if absent."""
+        for index, entry in enumerate(self._entries):
+            if entry.id != entry_id:
+                continue
+            self._entries.pop(index)
+            self._total_bytes -= entry.nbytes
+            info = {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "after_message": entry.after_message,
+                "tokens": len(entry.tokens),
+                "nbytes": entry.nbytes,
+                "arrays_bytes": entry.arrays_bytes,
+                "kv_bytes": entry.kv_bytes,
+                "relabels": len(entry.relabels),
+                "entries": len(self._entries),
+                "total_bytes": self._total_bytes,
+                "evictions_total": self._evictions,
+            }
+            self._emit("cache.delete", info)
+            return info
+        return None
+
+    @_locked
+    def relabel(
+        self, entry_id: int, position: int, new_id: int
+    ) -> dict[str, Any] | None:
+        """Replace entry token ``position`` with ``new_id`` and record it.
+
+        The caller is responsible for validating the position and that
+        ``new_id`` is a single token.  The token count never changes, so the
+        KV offsets in the stored state still line up.  Returns None if the
+        entry is absent.
+        """
+        for entry in self._entries:
+            if entry.id != entry_id:
+                continue
+            previous = next(
+                (item for item in entry.relabels if item["position"] == position),
+                None,
+            )
+            if previous is not None:
+                # Keep the first original for a position relabelled twice.
+                original_id = previous["original_id"]
+                previous["new_id"] = new_id
+            else:
+                original_id = entry.tokens[position]
+                entry.relabels.append(
+                    {
+                        "position": position,
+                        "original_id": original_id,
+                        "new_id": new_id,
+                    }
+                )
+            entry.tokens[position] = new_id
+            info = {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "position": position,
+                "original_id": original_id,
+                "new_id": new_id,
+                "relabels": len(entry.relabels),
+            }
+            self._emit("cache.relabel", info)
+            return info
+        return None
+
+    @_locked
+    def restore(self, entry_id: int) -> dict[str, Any] | None:
+        """Put the original token ids back and clear ``relabels``."""
+        for entry in self._entries:
+            if entry.id != entry_id:
+                continue
+            for item in entry.relabels:
+                entry.tokens[item["position"]] = item["original_id"]
+            count = len(entry.relabels)
+            entry.relabels = []
+            info = {
+                "entry_id": entry.id,
+                "kind": entry.kind,
+                "restored": count,
+                "relabels": 0,
+            }
+            self._emit("cache.restore", info)
+            return info
+        return None
+
     @_locked
     def summary(self, limit_bytes: int | None = None) -> dict[str, Any]:
         now = time.time()
@@ -607,6 +713,7 @@ class PromptCacheStore:
                 "age_seconds": round(now - entry.created, 2),
                 "last_used": entry.last_used,
                 "compat": list(entry.compat_key),
+                "relabels": len(entry.relabels),
             }
             for entry in self._entries
         ]

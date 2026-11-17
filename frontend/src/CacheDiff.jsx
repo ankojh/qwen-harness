@@ -20,8 +20,8 @@ function defaultEntryId(entries, prediction) {
   let best = entries[0]
   for (const entry of entries) {
     if (
-      entry.common_prefix > best.common_prefix
-      || (entry.common_prefix === best.common_prefix && entry.id === predicted)
+      entry.shared_prefix > best.shared_prefix
+      || (entry.shared_prefix === best.shared_prefix && entry.id === predicted)
     ) {
       best = entry
     }
@@ -32,7 +32,8 @@ function defaultEntryId(entries, prediction) {
 function entryLabel(entry, predictedId) {
   const parts = [`#${entry.id} ${entry.kind}`, `${entry.tokens} tokens`]
   if (entry.after_message != null) parts.push(`after message ${entry.after_message}`)
-  parts.push(`common prefix ${entry.common_prefix}`)
+  parts.push(`common prefix ${entry.shared_prefix}`)
+  if (entry.relabels) parts.push(`${entry.relabels} relabelled`)
   if (!entry.compatible) parts.push('incompatible')
   else if (entry.id === predictedId) parts.push('run will use')
   else if (entry.reusable_tokens === 0) parts.push('not usable')
@@ -161,6 +162,13 @@ export default function CacheDiff({ preview, thinkStart, thinkEnd }) {
                 <span className="muted">{diff.reason}</span>
               </div>
               {diff.truncated && <div className="note note-warn">{diff.truncated}</div>}
+              {diff.relabels?.length > 0 && (
+                <div className="note note-warn">
+                  {diff.relabels.length} relabelled position{diff.relabels.length === 1 ? '' : 's'} in this
+                  entry ({diff.relabels.map((item) => item.position).join(', ')}). The diff compares the
+                  relabelled ids; the computed state still represents the original text.
+                </div>
+              )}
 
               <div className="diff-grid">
                 <div className="diff-head">cache entry #{diff.entry.id} · {diff.entry_tokens} tokens</div>

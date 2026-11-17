@@ -67,6 +67,20 @@ export const diffCacheEntry = (entryId, tokenIds) =>
     method: 'POST',
     body: JSON.stringify({ entry_id: entryId, token_ids: tokenIds }),
   })
+export const deleteCacheEntry = (id) =>
+  request(`/api/cache/entries/${id}`, { method: 'DELETE' })
+export const saveCheckpoint = (session, afterMessage) =>
+  request('/api/cache/checkpoint', {
+    method: 'POST',
+    body: JSON.stringify({ session, after_message: afterMessage }),
+  })
+export const relabelEntry = (id, position, text) =>
+  request(`/api/cache/entries/${id}/relabel`, {
+    method: 'POST',
+    body: JSON.stringify({ position, text }),
+  })
+export const restoreEntry = (id) =>
+  request(`/api/cache/entries/${id}/restore`, { method: 'POST' })
 
 // Every named event the backend emits.  EventSource only fires onmessage for
 // unnamed events, so each type is registered explicitly.
@@ -88,6 +102,9 @@ export const EVENT_TYPES = [
   'cache.checkpoint',
   'cache.insert',
   'cache.evict',
+  'cache.delete',
+  'cache.relabel',
+  'cache.restore',
   'cache.clear',
   'cache.verify',
   'runtime.wired_limit',

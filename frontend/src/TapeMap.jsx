@@ -1,0 +1,451 @@
+import { useLayoutEffect, useRef, useState } from 'react'
+import { kindLabel, rulerStep } from './mapModel.js'
+
+// The centrepiece: one token-position ruler with the context tape, the
+// restored/computed band and one bar per cache entry.  Pure SVG, sized by a
+// ResizeObserver; one rect per span (not per token) when the tokens outnumber
+// the pixels, and tiny breaks stay at least 2 px wide.  Bars are sorted by
+// length (done in mapModel); at most ``maxRows`` are drawn and the rest fold
+// into a "+N more" row.
+//
+// ``fit`` picks the ruler domain: "context" (default) keeps the ruler on the
+// context plus the live generated tail, with bars longer than the domain torn
+// off at the right edge ("→ 863 (817 past the edge)"); "all" stretches the
+// ruler to the longest bar.
+
+const GUTTER = 118      // left label column
+const PAD = 14          // right padding
+const CELL_MIN = 2      // below this many px per token, draw spans not tokens
+const LABEL_MIN = 15    // below this, no token text inside cells
+const SPECIAL = new Set(['<|im_start|>', '<|im_end|>', '<think>', '</think>'])
+
+function shown(text) {
+  return (text || '').replace(/\n/g, '⏎').replace(/ /g, '␣')
+}
+
+function abbr(text, width) {
+  const value = shown(text)
+    .replace('<|im_start|>', '⟨s⟩')
+    .replace('<|im_end|>', '⟨/s⟩')
+    .replace('assistant', 'asst')
+  const max = Math.max(1, Math.floor(width / 6))
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value
+}
+
+function truncate(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+const ROLE_CLASS = { user: 'm-user', assistant: 'm-asst', system: 'm-sys', template: 'm-tpl' }
+
+function cellTitle(position, piece, id) {
+  return `position ${position} · ${shown(piece || '')}${id != null ? ` · id ${id}` : ''}`
+}
+
+export default function TapeMap({
+  model,
+  selectedEntryId,
+  selectedToken,
+  highlightMessage,
+  onSelectEntry,
+  onSelectToken,
+  onSelectMessage,
+  onDragLens,
+  maxRows = 8,
+  pulseEntryId = null,
+  fadingTail = [],
+  switching = false,
+  fit = 'context',
+}) {
+  const wrapRef = useRef(null)
+  const [width, setWidth] = useState(900)
+
+  useLayoutEffect(() => {
+    const el = wrapRef.current
+    if (!el) return undefined
+    const measure = () => setWidth(Math.max(el.clientWidth || 900, 560))
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  const drag = useRef(null)
+
+  const { tape, generatedTail, rows, ghosts, ticks, total, reused, computed, totalProcessed, pieces, lensCenter } = model
+  // The ruler domain: by default the context (+ the live tail + a little
+  // headroom), so one normal turn stays readable however long the entries
+  // are; "everything" stretches to the longest bar.
+  const contextDomain = Math.max(10, total + generatedTail.length + Math.max(3, Math.ceil(total * 0.06)))
+  const domain = fit === 'context' ? contextDomain : model.domain
+  const step = rulerStep(domain)
+  const plot = Math.max(40, width - GUTTER - PAD)
+  const x = (position) => GUTTER + (Math.min(position, domain) / domain) * plot
+  const cellWidth = plot / domain
+  const perToken = cellWidth >= CELL_MIN
+
+  // Tape rows
+  const tapeY = 30
+  const tapeH = 26
+  const bandY = tapeY + tapeH + 8
+  const bandH = 10
+  const bandBottom = bandY + bandH
+  // The "CACHE ENTRIES" header gets its own clear row; the chosen bar's
+  // arrow starts below it (a small ▲ under the band marks the top).
+  const headY = bandBottom + 15
+  let y = bandBottom + 38
+
+  const rowsShown = rows.slice(0, maxRows)
+  const folded = rows.slice(maxRows)
+  const chosenFolded = folded.some((row) => row.chosen)
+  const barH = 18
+
+  // Which span a message index highlights (chat bubble hover).
+  const hlSpan = tape.find((seg) => seg.messageIndex === highlightMessage) || null
+
+  function beginDrag(event, fallback) {
+    const startX = event.clientX
+    drag.current = { startX, moved: false, fallback }
+    const move = (ev) => {
+      if (!drag.current) return
+      if (Math.abs(ev.clientX - startX) > 4) drag.current.moved = true
+    }
+    const up = (ev) => {
+      if (!drag.current) return
+      const wasDrag = drag.current.moved
+      const startPosition = fallback
+      const endX = ev.clientX
+      drag.current = null
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      if (wasDrag) {
+        // Drag the lens window to the released position.
+        const rect = wrapRef.current.getBoundingClientRect()
+        const rel = endX - rect.left
+        const position = Math.max(0, Math.round(((rel - GUTTER) / plot) * domain))
+        onDragLens?.(position)
+      } else {
+        onSelectMessage?.(startPosition)
+      }
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
+
+  const tapeCells = []
+  if (perToken) {
+    for (const seg of tape) {
+      for (let position = seg.start; position < seg.end; position += 1) {
+        const piece = pieces[position]
+        const isSelected = selectedToken === position
+        tapeCells.push(
+          <g
+            key={position}
+            className="strip"
+            onClick={() => onSelectToken?.(position)}
+            style={{ cursor: 'pointer' }}
+          >
+            <rect
+              className={`${ROLE_CLASS[seg.role] || 'm-tpl'} ${isSelected ? 'm-sel' : ''}`}
+              x={x(position) + 0.5}
+              y={tapeY}
+              width={Math.max(cellWidth - 1, 1)}
+              height={tapeH}
+              rx={2}
+            >
+              <title>{cellTitle(position, piece?.text ?? piece?.piece, piece?.id)}</title>
+            </rect>
+            {cellWidth > LABEL_MIN && (
+              <text
+                x={x(position) + cellWidth / 2}
+                y={tapeY + 17}
+                textAnchor="middle"
+                fontSize={cellWidth > 26 ? 10 : 8}
+                className={SPECIAL.has(piece?.piece) ? 'm-mut' : undefined}
+                pointerEvents="none"
+              >
+                {abbr(piece?.text ?? piece?.piece ?? '', cellWidth)}
+              </text>
+            )}
+          </g>,
+        )
+      }
+    }
+  } else {
+    for (const seg of tape) {
+      tapeCells.push(
+        <g
+          key={`seg-${seg.start}`}
+          className="strip"
+          onMouseDown={(event) => beginDrag(event, seg.messageIndex ?? seg.start)}
+          onClick={() => onSelectMessage?.(seg.messageIndex ?? null)}
+        >
+          <rect
+            className={ROLE_CLASS[seg.role] || 'm-tpl'}
+            x={x(seg.start) + 0.5}
+            y={tapeY}
+            width={Math.max(x(seg.end) - x(seg.start) - 1, 2)}
+            height={tapeH}
+            rx={2}
+          >
+            <title>{`${seg.role} · positions ${seg.start}–${seg.end - 1} · drag to move the lens, click for details`}</title>
+          </rect>
+        </g>,
+      )
+    }
+  }
+
+  const generatedCells = generatedTail.map((token) => (    <g key={`gen-${token.position}`}>
+      <rect
+        className={token.channel === 'thinking' ? 'm-think' : 'm-asst'}
+        x={x(token.position) + 0.5}
+        y={tapeY}
+        width={Math.max(cellWidth - 1, 1)}
+        height={tapeH}
+        rx={2}
+      >
+        <title>{cellTitle(token.position, token.text ?? token.piece, token.id)}</title>
+      </rect>
+    </g>
+  ))
+
+  // The thinking that was just produced, fading out of the tape right after
+  // the run finished (it is never sent again).
+  const fadingCells = fadingTail.map((token, index) => (
+    <g key={`fade-${token.index ?? index}`} className="m-fadeout">
+      <rect
+        className={token.channel === 'thinking' ? 'm-think' : 'm-asst'}
+        x={x(total + index) + 0.5}
+        y={tapeY}
+        width={Math.max(cellWidth - 1, 1)}
+        height={tapeH}
+        rx={2}
+      >
+        <title>{cellTitle(total + index, token.text ?? token.piece, token.id)}</title>
+      </rect>
+    </g>
+  ))
+
+  const emptyTape = total === 0 && generatedTail.length === 0 ? (
+    <g>
+      <rect
+        x={GUTTER + 0.5}
+        y={tapeY}
+        width={plot - 1}
+        height={tapeH}
+        rx={2}
+        fill="none"
+        stroke="var(--border)"
+        strokeDasharray="5 4"
+      />
+      <text className="m-mut" x={GUTTER + plot / 2} y={tapeY + 17} textAnchor="middle">
+        type a message to see its tokens
+      </text>
+    </g>
+  ) : null
+
+  const tickMarks = step > 0 ? (() => {
+    const marks = []
+    for (let position = 0; position <= domain; position += step) {
+      marks.push(
+        <g key={`tick-${position}`}>
+          <line className="m-tick" x1={x(position)} y1={16} x2={x(position)} y2={21} />
+          <text className="m-mut" x={x(position)} y={13} textAnchor="middle" fontSize={10}>
+            {position}
+          </text>
+        </g>,
+      )
+    }
+    return marks
+  })() : null
+
+  const plusTicks = ticks.map((position) => (
+    <text key={`plus-${position}`} className="m-infotext" x={x(position) + 0.5} y={tapeY - 5} textAnchor="middle" fontSize={11} fontWeight={700}>
+      +
+    </text>
+  ))
+
+  // Band: restored / computed / waiting (running only) / generated.
+  // ``totalProcessed`` is a count of tokens computed after the restored
+  // prefix, so the computed segment ends at reused + totalProcessed.
+  const processedEnd = Math.min(total, reused + totalProcessed)
+  const bandSegments = []
+  if (reused > 0) {
+    bandSegments.push(<rect key="ok" className="m-band-ok" x={x(0)} y={bandY} width={Math.max(x(reused) - x(0), 2)} height={bandH} rx={2} />)
+  }
+  if (processedEnd > reused) {
+    bandSegments.push(<rect key="info" className="m-band-info" x={x(reused)} y={bandY} width={Math.max(x(processedEnd) - x(reused), 2)} height={bandH} rx={2} />)
+  }
+  if (processedEnd < total) {
+    bandSegments.push(<rect key="wait" className="m-band-wait" x={x(processedEnd)} y={bandY} width={Math.max(x(total) - x(processedEnd), 2)} height={bandH} rx={2} />)
+  }
+  if (generatedTail.length > 0) {
+    bandSegments.push(<rect key="think" className="m-band-think" x={x(total)} y={bandY} width={Math.max(x(total + generatedTail.length) - x(total), 2)} height={bandH} rx={2} />)
+  }
+
+  const entryRows = []
+  for (const row of rowsShown) {
+    const isSelected = row.id === selectedEntryId
+    const isChosen = row.chosen
+    const barEnd = Math.min(row.len, domain)
+    const past = Math.max(0, row.len - domain)
+    const breakInside = row.breakAt != null && row.breakAt < domain
+    const labelBudget = row.isNew && !row.ghost ? 17 : 19
+    const gutterLabel = truncate(`#${row.id} ${row.ghost ? '' : kindLabel(row.kind)}`, labelBudget)
+    entryRows.push(
+      <g key={row.id} className="strip" tabIndex={0} role="button" aria-label={`Cache entry ${row.id}`}
+        onClick={() => onSelectEntry?.(row.id)}
+        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelectEntry?.(row.id) } }}>
+        <rect className="m-hit" x={0} y={y - 4} width={width} height={barH + 8} />
+        <text x={4} y={y + 13} fontWeight={isSelected ? 700 : 500} className={row.ghost ? 'm-mut' : undefined}>
+          {row.isNew && !row.ghost && (
+            <tspan className="m-infotext" fontSize={8.5} fontWeight={700} dx={0} dy={0}>NEW </tspan>
+          )}
+          {gutterLabel}
+        </text>
+        {row.ghost && <text x={GUTTER - 4} y={y - 3} textAnchor="end" className="m-mut" fontSize={9}>evicted</text>}
+        <rect
+          className={`m-bar-ok ${row.ghost ? 'm-ghost' : ''}`}
+          x={x(0)}
+          y={y}
+          width={Math.max(x(row.match) - x(0), 2)}
+          height={barH}
+          rx={3}
+        />
+        {row.breakAt != null && !row.ghost && (
+          <>
+            <rect
+              className="m-hatch"
+              x={x(row.breakAt)}
+              y={y}
+              width={Math.max(x(barEnd) - x(row.breakAt), 2)}
+              height={barH}
+              rx={3}
+            >
+              <title>{`saved labels continue past the first difference at position ${row.breakAt}`}</title>
+            </rect>
+            {breakInside && (
+              <text className="m-badtext" x={x(row.breakAt)} y={y + 14} textAnchor="middle" fontWeight={700}>✕</text>
+            )}
+            {breakInside && (
+              <text className="m-mut" x={x(row.breakAt) + 10} y={y - 3} fontSize={10}>
+                breaks at {row.breakAt}
+              </text>
+            )}
+          </>
+        )}
+        {past > 0 && (
+          <>
+            <polyline
+              className="m-torn"
+              points={`${x(domain)},${y} ${x(domain) + 2},${y + 3} ${x(domain) - 2},${y + 6} ${x(domain) + 2},${y + 9} ${x(domain) - 2},${y + 12} ${x(domain)},${y + 15} ${x(domain) + 2},${y + 18}`}
+            />
+            <text className="m-mut" x={x(domain) - 4} y={y - 4} textAnchor="end" fontSize={9}>
+              → {row.len} ({past} past the edge)
+            </text>
+          </>
+        )}
+        {past === 0 && row.breakAt == null && row.usable && !row.ghost && (
+          <text className="m-oktext" x={x(row.len) + 6} y={y + 13} fontWeight={700}>
+            ✓ {isChosen ? 'restored' : 'usable'} · {row.len}
+          </text>
+        )}
+        {past === 0 && row.breakAt == null && !row.usable && !row.ghost && (
+          <text className="m-mut" x={x(row.len) + 6} y={y + 13} fontSize={10}>
+            · {row.len}
+          </text>
+        )}
+        {past === 0 && row.breakAt != null && !row.ghost && (
+          <text className="m-mut" x={x(row.len) + 6} y={y + 13} fontSize={10}>
+            · {row.len}
+          </text>
+        )}
+        {row.relabeled && (
+          <text className="m-warntext" x={x(barEnd) + 6} y={row.breakAt == null ? y - 4 : y + 26} fontSize={10}>
+            ⚠ label ≠ state
+          </text>
+        )}
+        {isSelected && (
+          <rect className="m-sel" x={x(0) - 2} y={y - 3} width={x(barEnd) - x(0) + 4} height={barH + 6} rx={4} pointerEvents="none" />
+        )}
+        {isSelected && breakInside && (
+          <line className="m-guide" x1={x(row.breakAt)} y1={tapeY} x2={x(row.breakAt)} y2={y + barH} pointerEvents="none" />
+        )}
+      </g>,
+    )
+    if (isChosen) {
+      const arrowX = x(Math.min(row.len, domain)) - 3
+      entryRows.push(
+        <g key={`arrow-${row.id}`} pointerEvents="none">
+          <line className="m-arrow" x1={arrowX} y1={headY + 6} x2={arrowX} y2={y - 3} markerEnd="url(#m-arr)" />
+          <path className="m-band-ok" d={`M${arrowX - 3.5} ${bandBottom + 2} L${arrowX + 3.5} ${bandBottom + 2} L${arrowX} ${bandBottom - 4} z`} />
+          {pulseEntryId === row.id && <rect className="m-pulse" x={x(0) - 2} y={y - 3} width={x(barEnd) - x(0) + 4} height={barH + 6} rx={4} />}
+        </g>,
+      )
+    }
+    y += barH + 15
+  }
+  if (folded.length > 0) {
+    entryRows.push(
+      <g key="folded">
+        <text className="m-mut" x={GUTTER} y={y + 12} fontSize={10}>
+          +{folded.length} more saved state{folded.length > 1 ? 's' : ''} (longest first)
+          {chosenFolded ? <tspan className="m-oktext"> · includes the restored entry</tspan> : null}
+        </text>
+      </g>,
+    )
+    y += 20
+  } else if (rows.length === 0) {
+    entryRows.push(
+      <text key="empty" className="m-mut" x={GUTTER} y={y + 12} fontSize={10}>
+        no saved states yet — this request computes everything
+      </text>,
+    )
+    y += 20
+  }
+
+  const height = y + 8
+  const hlOverlay = hlSpan ? (
+    <rect className="m-hl" x={x(hlSpan.start)} y={tapeY - 2} width={Math.max(x(hlSpan.end) - x(hlSpan.start), 3)} height={tapeH + 4} rx={3} pointerEvents="none" />
+  ) : null
+  const lensGuide = lensCenter >= 0 && lensCenter <= domain ? (
+    <line className="m-guide" x1={x(lensCenter)} y1={tapeY - 8} x2={x(lensCenter)} y2={bandBottom} pointerEvents="none" />
+  ) : null
+
+  return (
+    <div className={`map-wrap ${switching ? 'map-switch' : ''}`} ref={wrapRef} aria-label="Context tape and cache entry bars on one token-position ruler">
+      <svg className="map" role="img" viewBox={`0 0 ${width} ${height}`} height={height}>
+        <defs>
+          <pattern id="m-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <rect className="m-band-wait" width="6" height="6" />
+            <line className="m-hatch-line" x1="0" y1="0" x2="0" y2="6" />
+          </pattern>
+          <marker id="m-arr" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path className="m-band-ok" d="M0,0 L10,5 L0,10 z" />
+          </marker>
+        </defs>
+        <text className="m-mut" x="4" y={13}>position</text>
+        {tickMarks}
+        {plusTicks}
+        {emptyTape}
+        <text x="4" y={tapeY + 17} fontWeight={600}>Context</text>
+        {tapeCells}
+        {generatedCells}
+        {fadingCells}
+        {hlOverlay}
+        {lensGuide}
+        {generatedTail.length > 0 && (
+          <text className="m-mut" x={x(total) + 2} y={tapeY - 6} fontSize={10}>
+            generated → (thinking dashed: saved in the after-reply entry, never sent again)
+          </text>
+        )}
+        <text className="m-mut" x="4" y={bandY + 9} fontSize={10}>restored | computed</text>
+        {bandSegments}
+        <text className="m-mut" x="4" y={headY} fontSize={10} fontWeight={600}>
+          CACHE ENTRIES (saved states)
+        </text>
+        {entryRows}
+      </svg>
+    </div>
+  )
+}

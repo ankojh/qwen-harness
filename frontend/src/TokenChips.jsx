@@ -5,12 +5,24 @@ import { useState } from 'react'
 // apart, colours by span role, and marks ranges (cached, divergence, added,
 // removed).  Hover/focus shows position, id and the raw piece.  Very long
 // sequences show the first and last 200 tokens with a "show all" control.
+//
+// ``tampered`` lists positions whose token was relabelled: the chip shows in
+// red and its tooltip names the original piece.  ``onTokenClick`` turns the
+// chips into buttons (used by the Cache panel to open the relabel form).
 
 export function chipText(token) {
   return (token?.text || token?.piece || '').replace(/ /g, '␣').replace(/\n/g, '⏎')
 }
 
-export default function TokenChips({ tokens, spans, marks, offset = 0, limit = 400 }) {
+export default function TokenChips({
+  tokens,
+  spans,
+  marks,
+  tampered,
+  onTokenClick,
+  offset = 0,
+  limit = 400,
+}) {
   const [showAll, setShowAll] = useState(false)
   if (!tokens || tokens.length === 0) return null
 
@@ -18,7 +30,7 @@ export default function TokenChips({ tokens, spans, marks, offset = 0, limit = 4
   const truncated = !showAll && total > limit
   const half = Math.floor(limit / 2)
 
-  // Position -> span / mark lookup tables (built once per render).
+  // Position -> span / mark / tamper lookup tables (built once per render).
   const spanMap = new Map()
   if (spans) {
     for (const span of spans) {
@@ -34,6 +46,10 @@ export default function TokenChips({ tokens, spans, marks, offset = 0, limit = 4
         if (!markMap.has(position)) markMap.set(position, mark)
       }
     }
+  }
+  const tamperedMap = new Map()
+  if (tampered) {
+    for (const item of tampered) tamperedMap.set(item.position, item)
   }
 
   const items = truncated
@@ -62,8 +78,10 @@ export default function TokenChips({ tokens, spans, marks, offset = 0, limit = 4
           )
         }
         const { token, position } = item
+        const absolute = position + offset
         const span = spanMap.get(position) || null
         const mark = markMap.get(position) || null
+        const relabel = tamperedMap.get(position) || null
         const classes = ['token-chip']
         if (token.special) classes.push('tc-special')
         if (span) {
@@ -71,14 +89,29 @@ export default function TokenChips({ tokens, spans, marks, offset = 0, limit = 4
           else if (span.role) classes.push(`tc-${span.role}`)
         }
         if (mark) classes.push(`tc-${mark.kind}`)
-        return (
-          <span
+        if (relabel) classes.push('tc-tampered')
+        if (onTokenClick) classes.push('tc-clickable')
+        let title = `position ${absolute} · id ${token.id} · piece ${JSON.stringify(token.piece)}`
+        if (relabel) {
+          title += ` · relabelled: was ${JSON.stringify(relabel.original_piece)} (id ${relabel.original_id})`
+          if (onTokenClick) title += ' · click to relabel again'
+        } else if (onTokenClick) {
+          title += ' · click to relabel'
+        }
+        const inner = <>{chipText(token)}</>
+        return onTokenClick ? (
+          <button
             key={key}
+            type="button"
             className={classes.join(' ')}
-            tabIndex={0}
-            title={`position ${position + offset} · id ${token.id} · piece ${JSON.stringify(token.piece)}`}
+            title={title}
+            onClick={() => onTokenClick(absolute)}
           >
-            {chipText(token)}
+            {inner}
+          </button>
+        ) : (
+          <span key={key} className={classes.join(' ')} tabIndex={0} title={title}>
+            {inner}
           </span>
         )
       })}

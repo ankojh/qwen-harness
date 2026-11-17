@@ -193,6 +193,114 @@ def test_peek_does_not_touch_lru_or_lookup_state():
     assert store.summary() == before
 
 
+def test_compare_reports_exact_prefix_and_final_token_limit():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3], after_message=4)
+
+    row = store.compare([1, 2, 3, 4], KEY)[0]
+    assert row["id"] == 1
+    assert row["kind"] == "checkpoint"
+    assert row["after_message"] == 4
+    assert row["token_ids"] == [1, 2, 3]
+    assert row["shared_prefix"] == 3
+    assert row["reusable_tokens"] == 3
+    assert row["compatible"] is True
+    assert row["trimmable"] is False
+
+    # Equality is not a full reuse: generate_step must process the final input
+    # token, and this fixed state cannot be rewound to leave it out.
+    equal = store.compare([1, 2, 3], KEY)[0]
+    assert equal["shared_prefix"] == 3
+    assert equal["reusable_tokens"] == 0
+    assert "cannot rewind" in equal["reason"]
+
+
+def test_compare_reports_mismatch_and_cache_compatibility():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3, 4], key=KEY)
+    insert(store, [1, 2, 8], key=OTHER_KEY)
+
+    rows = store.compare([1, 2, 9, 10], KEY)
+    assert len(rows) == 2
+    matching_key, incompatible = rows
+    assert matching_key["shared_prefix"] == 2
+    assert matching_key["reusable_tokens"] == 0
+    assert "first different token at position 2" in matching_key["reason"].lower()
+    assert incompatible["compatible"] is False
+    assert incompatible["reusable_tokens"] == 0
+    assert "different model or cache settings" in incompatible["reason"].lower()
+
+
+def test_compare_reports_trimmable_partial_state_as_usable():
+    store = PromptCacheStore()
+    store.insert(
+        [1, 2, 3, 4], fake([1, 2, 3, 4], trimmable=True), "checkpoint", KEY,
+        max_entries=8, max_bytes=10_000,
+    )
+
+    row = store.compare([1, 2, 9, 10], KEY)[0]
+    assert row["shared_prefix"] == 2
+    assert row["reusable_tokens"] == 2
+    assert row["trimmable"] is True
+    assert "positions 0–1" in row["reason"]
+
+
+def test_relabel_changes_match_assessment_and_restore_recovers_it():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3], after_message=1)
+
+    store.relabel(1, 1, 20)
+    relabeled = store.compare([1, 2, 3, 4], KEY)[0]
+    assert relabeled["token_ids"] == [1, 20, 3]
+    assert relabeled["relabels"] == 1
+    assert relabeled["shared_prefix"] == 1
+    assert relabeled["reusable_tokens"] == 0
+
+    restored = store.restore(1)
+    assert restored["restored"] == 1
+    original = store.compare([1, 2, 3, 4], KEY)[0]
+    assert original["token_ids"] == [1, 2, 3]
+    assert original["relabels"] == 0
+    assert original["reusable_tokens"] == 3
+
+
+def test_relabel_and_restore_emit_events_with_entry_ids_and_counts():
+    store, events = store_with_events()
+    insert(store, [1, 2, 3])
+    events.clear()  # Ignore the setup insertion event.
+
+    relabeled = store.relabel(1, 1, 20)
+    restored = store.restore(1)
+    assert store.relabel(999, 0, 30) is None
+    assert store.restore(999) is None
+
+    assert events == [
+        (
+            "cache.relabel",
+            {
+                "entry_id": 1,
+                "kind": "checkpoint",
+                "position": 1,
+                "original_id": 2,
+                "new_id": 20,
+                "relabels": 1,
+            },
+        ),
+        (
+            "cache.restore",
+            {
+                "entry_id": 1,
+                "kind": "checkpoint",
+                "restored": 1,
+                "relabels": 0,
+            },
+        ),
+    ]
+    assert relabeled["entry_id"] == restored["entry_id"] == 1
+    assert relabeled["relabels"] == 1
+    assert restored["restored"] == 1
+
+
 # -------------------------------------------------------------- eviction/LRU
 def test_entry_limit_evicts_least_recently_used():
     store, events = store_with_events()
@@ -369,6 +477,141 @@ def test_token_lists_is_empty_for_an_empty_store():
     assert PromptCacheStore().token_lists() == []
 
 
+# --------------------------------------------------------------------- remove
+def test_remove_deletes_the_entry_updates_totals_and_emits():
+    store, events = store_with_events()
+    insert(store, [1, 2, 3], after_message=1)
+    insert(store, [4, 5], after_message=2)
+
+    info = store.remove(1)
+    assert info["entry_id"] == 1
+    assert info["after_message"] == 1
+    assert info["tokens"] == 3
+    assert info["entries"] == 1
+    assert info["total_bytes"] == 100
+    assert [entry["id"] for entry in store.summary()["entries"]] == [2]
+    assert store.summary()["total_bytes"] == 100
+    assert events[-1][0] == "cache.delete"
+    assert events[-1][1]["entry_id"] == 1
+
+
+def test_remove_returns_none_for_an_unknown_id():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3])
+    assert store.remove(999) is None
+    assert store.summary()["entries_count"] == 1
+
+
+# ----------------------------------------------------------- relabel/restore
+def test_relabel_replaces_the_token_and_records_it():
+    store = PromptCacheStore()
+    info = insert(store, [1, 2, 3])
+    entry_id = info["entry_id"]
+
+    result = store.relabel(entry_id, 1, 99)
+    assert result == {
+        "entry_id": entry_id,
+        "kind": "checkpoint",
+        "position": 1,
+        "original_id": 2,
+        "new_id": 99,
+        "relabels": 1,
+    }
+    entry = store.get_entry(entry_id)
+    assert entry.tokens == [1, 99, 3]
+    assert entry.relabels == [{"position": 1, "original_id": 2, "new_id": 99}]
+
+
+def test_relabelling_the_same_position_twice_keeps_the_first_original():
+    store = PromptCacheStore()
+    info = insert(store, [1, 2, 3])
+    entry_id = info["entry_id"]
+
+    store.relabel(entry_id, 1, 99)
+    result = store.relabel(entry_id, 1, 7)
+
+    entry = store.get_entry(entry_id)
+    assert entry.tokens == [1, 7, 3]
+    assert entry.relabels == [{"position": 1, "original_id": 2, "new_id": 7}]
+    assert result["original_id"] == 2
+    assert result["new_id"] == 7
+    assert result["relabels"] == 1
+
+
+def test_restore_puts_originals_back_and_clears_relabels():
+    store = PromptCacheStore()
+    info = insert(store, [1, 2, 3])
+    entry_id = info["entry_id"]
+    store.relabel(entry_id, 0, 50)
+    store.relabel(entry_id, 2, 60)
+
+    result = store.restore(entry_id)
+    assert result == {
+        "entry_id": entry_id,
+        "kind": "checkpoint",
+        "restored": 2,
+        "relabels": 0,
+    }
+    entry = store.get_entry(entry_id)
+    assert entry.tokens == [1, 2, 3]
+    assert entry.relabels == []
+
+
+def test_relabel_and_restore_return_none_for_an_unknown_id():
+    store = PromptCacheStore()
+    insert(store, [1, 2, 3])
+    assert store.relabel(999, 0, 1) is None
+    assert store.restore(999) is None
+
+
+def test_a_relabelled_entry_is_matched_by_its_new_tokens():
+    store = PromptCacheStore()
+    info = store.insert(
+        [1, 2, 3, 4],
+        fake([1, 2, 3, 4], trimmable=True),
+        "checkpoint",
+        KEY,
+        max_entries=8,
+        max_bytes=10_000,
+    )
+    entry_id = info["entry_id"]
+
+    store.relabel(entry_id, 1, 99)
+
+    # The old sequence no longer matches past the relabelled position.
+    _, reused_old, info_old = store.lookup([1, 2, 3, 4, 5], KEY)
+    assert reused_old == 1
+
+    # The new sequence matches in full and reports the entry as relabeled.
+    cache, reused_new, info_new = store.lookup([1, 99, 3, 4, 5], KEY)
+    assert reused_new == 4
+    assert cache is not None
+    assert info_new["entry_id"] == entry_id
+    assert info_new["relabeled"] is True
+
+    prediction = store.peek([1, 99, 3, 4, 5], KEY)
+    assert prediction["reused_tokens"] == 4
+    assert prediction["relabeled"] is True
+
+
+def test_lookup_miss_reports_relabeled_false():
+    store = PromptCacheStore()
+    _, reused, info = store.lookup([1, 2, 3], KEY)
+    assert reused == 0
+    assert info["relabeled"] is False
+
+
+def test_summary_reports_relabels_count():
+    store = PromptCacheStore()
+    info = insert(store, [1, 2, 3])
+    entry_id = info["entry_id"]
+    store.relabel(entry_id, 0, 50)
+    store.relabel(entry_id, 1, 60)
+
+    row = store.summary()["entries"][0]
+    assert row["relabels"] == 2
+
+
 # ----------------------------------------------------------------- get_entry
 def test_get_entry_returns_the_matching_entry_or_none():
     store = PromptCacheStore()
@@ -469,28 +712,3 @@ def test_describe_cache_layers_reports_every_layer_in_order():
         "full_attention",
         "full_attention",
     ]
-
-
-# -------------------------------------------------------------------- compare
-def test_compare_reports_every_entry_with_the_lookup_rule():
-    store = PromptCacheStore()
-    insert(store, [1, 2], after_message=1)  # prefix of the prompt
-    insert(store, [1, 2, 9, 9], kind="after-generation")  # diverges before its end
-    insert(store, [1, 2, 3], key=OTHER_KEY)  # incompatible settings
-    rows = {row["id"]: row for row in store.compare([1, 2, 3, 4], KEY)}
-
-    assert rows[1]["reusable_tokens"] == 2 and rows[1]["reason"] == ""
-    assert rows[2]["common_prefix"] == 2
-    assert rows[2]["reusable_tokens"] == 0
-    assert "not trimmable" in rows[2]["reason"]
-    assert rows[3]["compatible"] is False and rows[3]["reusable_tokens"] == 0
-    # The dry-run prediction agrees with the best usable row.
-    assert store.peek([1, 2, 3, 4], KEY)["entry_id"] == 1
-
-
-def test_compare_does_not_touch_lru():
-    store = PromptCacheStore()
-    insert(store, [1, 2])
-    before = store.summary()["entries"][0]["last_used"]
-    store.compare([1, 2, 3], KEY)
-    assert store.summary()["entries"][0]["last_used"] == before
